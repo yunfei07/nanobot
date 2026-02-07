@@ -365,6 +365,11 @@ def gateway(
             for bot_id, bot in config.agents.bots.items()
             if bot.model
         },
+        bot_persona_prompts={
+            bot_id: bot.persona_prompt
+            for bot_id, bot in config.agents.bots.items()
+            if bot.persona_prompt
+        },
     )
     
     # Set cron callback (needs agent)
@@ -471,6 +476,11 @@ def agent(
             bot_id: bot.model
             for bot_id, bot in config.agents.bots.items()
             if bot.model
+        },
+        bot_persona_prompts={
+            bot_id: bot.persona_prompt
+            for bot_id, bot in config.agents.bots.items()
+            if bot.persona_prompt
         },
     )
     

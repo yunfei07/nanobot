@@ -47,6 +47,7 @@ class AgentLoop:
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
         bot_models: dict[str, str] | None = None,
+        bot_persona_prompts: dict[str, str] | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig
         from nanobot.cron.service import CronService
@@ -60,6 +61,7 @@ class AgentLoop:
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
         self.bot_models = bot_models or {}
+        self.bot_persona_prompts = bot_persona_prompts or {}
         
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
@@ -198,6 +200,19 @@ class AgentLoop:
             channel=msg.channel,
             chat_id=msg.chat_id,
         )
+        if bot_id:
+            persona_prompt = self.bot_persona_prompts.get(bot_id, "").strip()
+            if persona_prompt:
+                messages.insert(
+                    1,
+                    {
+                        "role": "system",
+                        "content": (
+                            f"You are the configured role bot '{bot_id}'. "
+                            f"Follow this role guidance strictly:\n{persona_prompt}"
+                        ),
+                    },
+                )
         
         # Agent loop
         iteration = 0

@@ -90,7 +90,10 @@ class ChannelManager:
             try:
                 from nanobot.channels.ios import IOSChannel
                 self.channels["ios"] = IOSChannel(
-                    self.config.channels.ios, self.bus
+                    self.config.channels.ios,
+                    self.bus,
+                    workspace=self.config.workspace_path,
+                    bot_profiles=self.config.agents.bots,
                 )
                 logger.info("iOS channel enabled")
             except ImportError as e:

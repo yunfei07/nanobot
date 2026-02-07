@@ -139,6 +139,11 @@ class AgentDefaults(BaseModel):
 class AgentBotConfig(BaseModel):
     """Per-bot model override for multi-bot routing."""
     model: str = ""
+    name: str = ""
+    description: str = ""
+    aliases: list[str] = Field(default_factory=list)
+    persona_prompt: str = ""
+    accent_hex: str = ""
 
 
 class AgentsConfig(BaseModel):
