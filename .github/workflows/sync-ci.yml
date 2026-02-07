@@ -1,0 +1,38 @@
+name: sync-ci
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - labeled
+
+jobs:
+  validate-sync-pr:
+    if: startsWith(github.head_ref, 'sync/upstream-') || contains(join(github.event.pull_request.labels.*.name, ','), 'upstream-sync')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run targeted tests
+        run: |
+          pytest -q tests/test_tool_validation.py
+
+      - name: Validate python compilation
+        run: |
+          python -m compileall -q nanobot
+
