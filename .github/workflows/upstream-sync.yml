@@ -1,0 +1,74 @@
+name: upstream-sync
+
+on:
+  schedule:
+    - cron: "0 2 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git remotes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/HKUDS/nanobot.git 2>/dev/null || true
+          git remote set-url upstream https://github.com/HKUDS/nanobot.git
+          git remote set-url origin https://github.com/${{ github.repository }}.git
+
+      - name: Run upstream sync
+        id: sync
+        env:
+          UPSTREAM_REMOTE: upstream
+          UPSTREAM_BRANCH: main
+          BASE_BRANCH: main
+        run: |
+          bash scripts/upstream_sync.sh
+
+      - name: Ensure labels exist
+        if: steps.sync.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create upstream-sync \
+            --color "0366d6" \
+            --description "Automated upstream sync PR" \
+            --force
+          gh label create needs-conflict-resolve \
+            --color "d73a4a" \
+            --description "Manual merge conflict resolution required" \
+            --force
+
+      - name: Create or update sync PR
+        if: steps.sync.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SYNC_BRANCH: ${{ steps.sync.outputs.sync_branch }}
+          PR_TITLE: ${{ steps.sync.outputs.pr_title }}
+          PR_LABELS: ${{ steps.sync.outputs.pr_labels }}
+          PR_BODY_FILE: ${{ steps.sync.outputs.pr_body_file }}
+        run: |
+          if gh pr view "${SYNC_BRANCH}" --json number >/dev/null 2>&1; then
+            gh pr edit "${SYNC_BRANCH}" --title "${PR_TITLE}" --body-file "${PR_BODY_FILE}"
+          else
+            gh pr create --base main --head "${SYNC_BRANCH}" --title "${PR_TITLE}" --body-file "${PR_BODY_FILE}"
+          fi
+
+          IFS=',' read -ra labels <<< "${PR_LABELS}"
+          for raw in "${labels[@]}"; do
+            label="$(echo "${raw}" | xargs)"
+            if [[ -n "${label}" ]]; then
+              gh pr edit "${SYNC_BRANCH}" --add-label "${label}"
+            fi
+          done
+
