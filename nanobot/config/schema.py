@@ -105,12 +105,22 @@ class QQConfig(BaseModel):
     allow_from: list[str] = Field(default_factory=list)  # Allowed user openids (empty = public access)
 
 
+class IOSConfig(BaseModel):
+    """iOS app channel configuration over WebSocket."""
+    enabled: bool = False
+    host: str = "0.0.0.0"
+    port: int = 8765
+    auth_token: str = ""  # Optional shared token from iOS client payload
+    allow_from: list[str] = Field(default_factory=list)  # Allowed sender IDs
+
+
 class ChannelsConfig(BaseModel):
     """Configuration for chat channels."""
     whatsapp: WhatsAppConfig = Field(default_factory=WhatsAppConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     discord: DiscordConfig = Field(default_factory=DiscordConfig)
     feishu: FeishuConfig = Field(default_factory=FeishuConfig)
+    ios: IOSConfig = Field(default_factory=IOSConfig)
     dingtalk: DingTalkConfig = Field(default_factory=DingTalkConfig)
     email: EmailConfig = Field(default_factory=EmailConfig)
     slack: SlackConfig = Field(default_factory=SlackConfig)
@@ -126,9 +136,15 @@ class AgentDefaults(BaseModel):
     max_tool_iterations: int = 20
 
 
+class AgentBotConfig(BaseModel):
+    """Per-bot model override for multi-bot routing."""
+    model: str = ""
+
+
 class AgentsConfig(BaseModel):
     """Agent configuration."""
     defaults: AgentDefaults = Field(default_factory=AgentDefaults)
+    bots: dict[str, AgentBotConfig] = Field(default_factory=dict)
 
 
 class ProviderConfig(BaseModel):
@@ -189,7 +205,7 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
-    
+
     @property
     def workspace_path(self) -> Path:
         """Get expanded workspace path."""
@@ -227,7 +243,6 @@ class Config(BaseSettings):
         """Get API key for the given model. Falls back to first available key."""
         p = self.get_provider(model)
         return p.api_key if p else None
-    
     def get_api_base(self, model: str | None = None) -> str | None:
         """Get API base URL for the given model. Applies default URLs for known gateways."""
         from nanobot.providers.registry import find_by_name
@@ -242,7 +257,7 @@ class Config(BaseSettings):
             if spec and spec.is_gateway and spec.default_api_base:
                 return spec.default_api_base
         return None
-    
+
     class Config:
         env_prefix = "NANOBOT_"
         env_nested_delimiter = "__"

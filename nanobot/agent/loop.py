@@ -46,6 +46,7 @@ class AgentLoop:
         cron_service: "CronService | None" = None,
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
+        bot_models: dict[str, str] | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig
         from nanobot.cron.service import CronService
@@ -58,6 +59,7 @@ class AgentLoop:
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
+        self.bot_models = bot_models or {}
         
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
@@ -158,9 +160,22 @@ class AgentLoop:
         
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info(f"Processing message from {msg.channel}:{msg.sender_id}: {preview}")
+
+        bot_id = str(msg.metadata.get("bot_id", "")).strip() if msg.metadata else ""
+        active_model = self.model
+        if bot_id:
+            mapped = self.bot_models.get(bot_id, "").strip()
+            if mapped:
+                active_model = mapped
+                logger.info(f"Using bot '{bot_id}' with model '{active_model}'")
+            else:
+                logger.info(f"Bot '{bot_id}' has no configured model override; using default.")
         
         # Get or create session
-        session = self.sessions.get_or_create(msg.session_key)
+        session_key = msg.session_key
+        if bot_id:
+            session_key = f"{session_key}:bot:{bot_id}"
+        session = self.sessions.get_or_create(session_key)
         
         # Update tool contexts
         message_tool = self.tools.get("message")
@@ -195,7 +210,7 @@ class AgentLoop:
             response = await self.provider.chat(
                 messages=messages,
                 tools=self.tools.get_definitions(),
-                model=self.model
+                model=active_model
             )
             
             # Handle tool calls
@@ -242,11 +257,15 @@ class AgentLoop:
         session.add_message("assistant", final_content)
         self.sessions.save(session)
         
+        metadata = dict(msg.metadata or {})
+        if bot_id:
+            metadata["bot_id"] = bot_id
+
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
             content=final_content,
-            metadata=msg.metadata or {},  # Pass through for channel-specific needs (e.g. Slack thread_ts)
+            metadata=metadata,  # Pass through for channel-specific needs (e.g. Slack thread_ts)
         )
     
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
