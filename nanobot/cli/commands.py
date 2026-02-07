@@ -210,6 +210,11 @@ def gateway(
         exec_config=config.tools.exec,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
+        bot_models={
+            bot_id: bot.model
+            for bot_id, bot in config.agents.bots.items()
+            if bot.model
+        },
     )
     
     # Set cron callback (needs agent)
@@ -318,6 +323,11 @@ def agent(
         brave_api_key=config.tools.web.search.api_key or None,
         exec_config=config.tools.exec,
         restrict_to_workspace=config.tools.restrict_to_workspace,
+        bot_models={
+            bot_id: bot.model
+            for bot_id, bot in config.agents.bots.items()
+            if bot.model
+        },
     )
     
     if message:
@@ -390,6 +400,16 @@ def channels_status():
         "Telegram",
         "✓" if tg.enabled else "✗",
         tg_config
+    )
+
+    ios = config.channels.ios
+    ios_cfg = f"ws://{ios.host}:{ios.port}"
+    if ios.auth_token:
+        ios_cfg += " (token auth)"
+    table.add_row(
+        "iOS",
+        "✓" if ios.enabled else "✗",
+        ios_cfg,
     )
 
     console.print(table)

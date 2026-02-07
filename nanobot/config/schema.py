@@ -39,12 +39,22 @@ class DiscordConfig(BaseModel):
     intents: int = 37377  # GUILDS + GUILD_MESSAGES + DIRECT_MESSAGES + MESSAGE_CONTENT
 
 
+class IOSConfig(BaseModel):
+    """iOS app channel configuration over WebSocket."""
+    enabled: bool = False
+    host: str = "0.0.0.0"
+    port: int = 8765
+    auth_token: str = ""  # Optional shared token from iOS client payload
+    allow_from: list[str] = Field(default_factory=list)  # Allowed sender IDs
+
+
 class ChannelsConfig(BaseModel):
     """Configuration for chat channels."""
     whatsapp: WhatsAppConfig = Field(default_factory=WhatsAppConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     discord: DiscordConfig = Field(default_factory=DiscordConfig)
     feishu: FeishuConfig = Field(default_factory=FeishuConfig)
+    ios: IOSConfig = Field(default_factory=IOSConfig)
 
 
 class AgentDefaults(BaseModel):
@@ -56,9 +66,15 @@ class AgentDefaults(BaseModel):
     max_tool_iterations: int = 20
 
 
+class AgentBotConfig(BaseModel):
+    """Per-bot model override for multi-bot routing."""
+    model: str = ""
+
+
 class AgentsConfig(BaseModel):
     """Agent configuration."""
     defaults: AgentDefaults = Field(default_factory=AgentDefaults)
+    bots: dict[str, AgentBotConfig] = Field(default_factory=dict)
 
 
 class ProviderConfig(BaseModel):
@@ -117,12 +133,12 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
-    
+
     @property
     def workspace_path(self) -> Path:
         """Get expanded workspace path."""
         return Path(self.agents.defaults.workspace).expanduser()
-    
+
     def _match_provider(self, model: str | None = None) -> ProviderConfig | None:
         """Match a provider based on model name."""
         model = (model or self.agents.defaults.model).lower()
@@ -167,7 +183,7 @@ class Config(BaseSettings):
             if provider.api_key:
                 return provider.api_key
         return None
-    
+
     def get_api_base(self, model: str | None = None) -> str | None:
         """Get API base URL based on model name."""
         model = (model or self.agents.defaults.model).lower()
@@ -178,7 +194,7 @@ class Config(BaseSettings):
         if "vllm" in model:
             return self.providers.vllm.api_base
         return None
-    
+
     class Config:
         env_prefix = "NANOBOT_"
         env_nested_delimiter = "__"
