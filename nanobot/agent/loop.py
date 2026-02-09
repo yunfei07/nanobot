@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +22,7 @@ from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.subagent import SubagentManager
 from nanobot.session.manager import SessionManager
+from nanobot.cron.types import CronSchedule
 
 
 class AgentLoop:
@@ -45,7 +48,6 @@ class AgentLoop:
         exec_config: "ExecToolConfig | None" = None,
         cron_service: "CronService | None" = None,
         restrict_to_workspace: bool = False,
-        session_manager: SessionManager | None = None,
         bot_models: dict[str, str] | None = None,
         bot_persona_prompts: dict[str, str] | None = None,
     ):
@@ -64,7 +66,7 @@ class AgentLoop:
         self.bot_persona_prompts = bot_persona_prompts or {}
         
         self.context = ContextBuilder(workspace)
-        self.sessions = session_manager or SessionManager(workspace)
+        self.sessions = SessionManager(workspace)
         self.tools = ToolRegistry()
         self.subagents = SubagentManager(
             provider=provider,
@@ -190,7 +192,7 @@ class AgentLoop:
         
         cron_tool = self.tools.get("cron")
         if isinstance(cron_tool, CronTool):
-            cron_tool.set_context(msg.channel, msg.chat_id)
+            cron_tool.set_context(msg.channel, msg.chat_id, sender_id=msg.sender_id)
         
         # Build initial messages (use get_history for LLM-formatted messages)
         messages = self.context.build_messages(
@@ -217,6 +219,8 @@ class AgentLoop:
         # Agent loop
         iteration = 0
         final_content = None
+        final_assistant_metadata: dict[str, Any] = {}
+        cron_job_created = False
         
         while iteration < self.max_iterations:
             iteration += 1
@@ -243,8 +247,10 @@ class AgentLoop:
                     for tc in response.tool_calls
                 ]
                 messages = self.context.add_assistant_message(
-                    messages, response.content, tool_call_dicts,
-                    reasoning_content=response.reasoning_content,
+                    messages,
+                    response.content,
+                    tool_call_dicts,
+                    assistant_metadata=response.assistant_metadata,
                 )
                 
                 # Execute tools
@@ -252,16 +258,25 @@ class AgentLoop:
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info(f"Tool call: {tool_call.name}({args_str[:200]})")
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    if tool_call.name == "cron" and isinstance(result, str) and "Created job" in result:
+                        cron_job_created = True
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
             else:
                 # No tool calls, we're done
                 final_content = response.content
+                final_assistant_metadata = response.assistant_metadata
                 break
         
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
+
+        self._maybe_schedule_reminder_fallback(
+            msg=msg,
+            final_content=final_content,
+            cron_job_created=cron_job_created,
+        )
         
         # Log response preview
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
@@ -269,18 +284,22 @@ class AgentLoop:
         
         # Save to session
         session.add_message("user", msg.content)
-        session.add_message("assistant", final_content)
+        session.add_message("assistant", final_content, **final_assistant_metadata)
         self.sessions.save(session)
         
-        metadata = dict(msg.metadata or {})
+        out_meta: dict[str, Any] = {}
         if bot_id:
-            metadata["bot_id"] = bot_id
+            out_meta["bot_id"] = bot_id
+        for passthrough_key in ("client_request_id", "conversation_type"):
+            value = msg.metadata.get(passthrough_key) if msg.metadata else None
+            if value:
+                out_meta[passthrough_key] = value
 
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
             content=final_content,
-            metadata=metadata,  # Pass through for channel-specific needs (e.g. Slack thread_ts)
+            metadata=out_meta,
         )
     
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
@@ -317,7 +336,7 @@ class AgentLoop:
         
         cron_tool = self.tools.get("cron")
         if isinstance(cron_tool, CronTool):
-            cron_tool.set_context(origin_channel, origin_chat_id)
+            cron_tool.set_context(origin_channel, origin_chat_id, sender_id=msg.sender_id)
         
         # Build messages with the announce content
         messages = self.context.build_messages(
@@ -330,6 +349,7 @@ class AgentLoop:
         # Agent loop (limited for announce handling)
         iteration = 0
         final_content = None
+        final_assistant_metadata: dict[str, Any] = {}
         
         while iteration < self.max_iterations:
             iteration += 1
@@ -353,8 +373,10 @@ class AgentLoop:
                     for tc in response.tool_calls
                 ]
                 messages = self.context.add_assistant_message(
-                    messages, response.content, tool_call_dicts,
-                    reasoning_content=response.reasoning_content,
+                    messages,
+                    response.content,
+                    tool_call_dicts,
+                    assistant_metadata=response.assistant_metadata,
                 )
                 
                 for tool_call in response.tool_calls:
@@ -366,6 +388,7 @@ class AgentLoop:
                     )
             else:
                 final_content = response.content
+                final_assistant_metadata = response.assistant_metadata
                 break
         
         if final_content is None:
@@ -373,7 +396,7 @@ class AgentLoop:
         
         # Save to session (mark as system message in history)
         session.add_message("user", f"[System: {msg.sender_id}] {msg.content}")
-        session.add_message("assistant", final_content)
+        session.add_message("assistant", final_content, **final_assistant_metadata)
         self.sessions.save(session)
         
         return OutboundMessage(
@@ -410,3 +433,63 @@ class AgentLoop:
         
         response = await self._process_message(msg)
         return response.content if response else ""
+
+    @staticmethod
+    def _parse_relative_minutes_reminder(content: str) -> tuple[int, str] | None:
+        text = content.strip()
+        if not text:
+            return None
+
+        patterns = (
+            r"(?P<minutes>\d{1,4})\s*分钟后[，,\s]*提醒我(?P<what>.+)",
+            r"(?P<minutes>\d{1,4})\s*min(?:ute)?s?\s*(?:later)?[,\s]*(?:remind me(?: to)?)(?P<what>.+)",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if not match:
+                continue
+            try:
+                minutes = int(match.group("minutes"))
+            except (TypeError, ValueError):
+                continue
+            what = (match.group("what") or "").strip()
+            if minutes <= 0 or not what:
+                continue
+            return minutes, what
+
+        return None
+
+    def _maybe_schedule_reminder_fallback(
+        self,
+        *,
+        msg: InboundMessage,
+        final_content: str,
+        cron_job_created: bool,
+    ) -> None:
+        if cron_job_created or not self.cron_service:
+            return
+
+        parsed = self._parse_relative_minutes_reminder(msg.content)
+        if not parsed:
+            return
+
+        minutes, reminder_text = parsed
+        run_at = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+        schedule = CronSchedule(kind="at", at_ms=int(run_at.timestamp() * 1000))
+        job_name = reminder_text[:30] or f"reminder-{minutes}m"
+
+        job = self.cron_service.add_job(
+            name=job_name,
+            schedule=schedule,
+            message=f"⏰ {reminder_text}",
+            deliver=True,
+            channel=msg.channel,
+            to=msg.chat_id,
+            user_id=msg.sender_id,
+        )
+        preview = final_content[:80] + "..." if len(final_content) > 80 else final_content
+        logger.warning(
+            "Reminder fallback created cron job "
+            f"id={job.id} channel={msg.channel} chat_id={msg.chat_id} user={msg.sender_id} "
+            f"minutes={minutes} response_preview={preview}"
+        )

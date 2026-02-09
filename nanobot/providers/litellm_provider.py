@@ -1,6 +1,5 @@
 """LiteLLM provider implementation for multi-provider support."""
 
-import json
 import os
 from typing import Any
 
@@ -8,7 +7,6 @@ import litellm
 from litellm import acompletion
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
-from nanobot.providers.registry import find_by_model, find_gateway
 
 
 class LiteLLMProvider(LLMProvider):
@@ -16,8 +14,7 @@ class LiteLLMProvider(LLMProvider):
     LLM provider using LiteLLM for multi-provider support.
     
     Supports OpenRouter, Anthropic, OpenAI, Gemini, and many other providers through
-    a unified interface.  Provider-specific logic is driven by the registry
-    (see providers/registry.py) — no if-elif chains needed here.
+    a unified interface.
     """
     
     def __init__(
@@ -26,78 +23,82 @@ class LiteLLMProvider(LLMProvider):
         api_base: str | None = None,
         default_model: str = "anthropic/claude-opus-4-5",
         extra_headers: dict[str, str] | None = None,
-        provider_name: str | None = None,
+        provider_keys: dict[str, str] | None = None,
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
         self.extra_headers = extra_headers or {}
+        self.provider_keys = {k.lower(): v for k, v in (provider_keys or {}).items() if v}
         
-        # Detect gateway / local deployment.
-        # provider_name (from config key) is the primary signal;
-        # api_key / api_base are fallback for auto-detection.
-        self._gateway = find_gateway(provider_name, api_key, api_base)
+        # Detect OpenRouter by api_key prefix or explicit api_base
+        self.is_openrouter = (
+            (api_key and api_key.startswith("sk-or-")) or
+            (api_base and "openrouter" in api_base)
+        )
         
-        # Configure environment variables
+        # Detect AiHubMix by api_base
+        self.is_aihubmix = bool(api_base and "aihubmix" in api_base)
+        
+        # Track if using custom endpoint (vLLM, etc.)
+        self.is_vllm = bool(api_base) and not self.is_openrouter and not self.is_aihubmix
+        
+        # Configure LiteLLM based on provider
         if api_key:
-            self._setup_env(api_key, api_base, default_model)
+            if self.is_openrouter:
+                # OpenRouter mode - set key
+                os.environ["OPENROUTER_API_KEY"] = api_key
+            elif self.is_aihubmix:
+                # AiHubMix gateway - OpenAI-compatible
+                os.environ["OPENAI_API_KEY"] = api_key
+            elif self.is_vllm:
+                # vLLM/custom endpoint - uses OpenAI-compatible API
+                os.environ["HOSTED_VLLM_API_KEY"] = api_key
+            elif "deepseek" in default_model:
+                os.environ.setdefault("DEEPSEEK_API_KEY", api_key)
+            elif "anthropic" in default_model:
+                os.environ.setdefault("ANTHROPIC_API_KEY", api_key)
+            elif "openai" in default_model or "gpt" in default_model:
+                os.environ.setdefault("OPENAI_API_KEY", api_key)
+            elif "gemini" in default_model.lower():
+                os.environ.setdefault("GEMINI_API_KEY", api_key)
+            elif "zhipu" in default_model or "glm" in default_model or "zai" in default_model:
+                os.environ.setdefault("ZAI_API_KEY", api_key)
+                os.environ.setdefault("ZHIPUAI_API_KEY", api_key)
+            elif "dashscope" in default_model or "qwen" in default_model.lower():
+                os.environ.setdefault("DASHSCOPE_API_KEY", api_key)
+            elif "groq" in default_model:
+                os.environ.setdefault("GROQ_API_KEY", api_key)
+            elif "moonshot" in default_model or "kimi" in default_model:
+                os.environ.setdefault("MOONSHOT_API_KEY", api_key)
+                os.environ.setdefault("MOONSHOT_API_BASE", api_base or "https://api.moonshot.cn/v1")
+
+        # Also expose explicit provider keys for dynamic per-message model routing.
+        for provider, key in self.provider_keys.items():
+            if provider == "openrouter":
+                os.environ.setdefault("OPENROUTER_API_KEY", key)
+            elif provider == "anthropic":
+                os.environ.setdefault("ANTHROPIC_API_KEY", key)
+            elif provider == "openai":
+                os.environ.setdefault("OPENAI_API_KEY", key)
+            elif provider == "deepseek":
+                os.environ.setdefault("DEEPSEEK_API_KEY", key)
+            elif provider == "gemini":
+                os.environ.setdefault("GEMINI_API_KEY", key)
+            elif provider == "zhipu":
+                os.environ.setdefault("ZAI_API_KEY", key)
+                os.environ.setdefault("ZHIPUAI_API_KEY", key)
+            elif provider == "dashscope":
+                os.environ.setdefault("DASHSCOPE_API_KEY", key)
+            elif provider == "groq":
+                os.environ.setdefault("GROQ_API_KEY", key)
+            elif provider == "moonshot":
+                os.environ.setdefault("MOONSHOT_API_KEY", key)
         
         if api_base:
             litellm.api_base = api_base
         
         # Disable LiteLLM logging noise
         litellm.suppress_debug_info = True
-        # Drop unsupported parameters for providers (e.g., gpt-5 rejects some params)
-        litellm.drop_params = True
-    
-    def _setup_env(self, api_key: str, api_base: str | None, model: str) -> None:
-        """Set environment variables based on detected provider."""
-        spec = self._gateway or find_by_model(model)
-        if not spec:
-            return
-
-        # Gateway/local overrides existing env; standard provider doesn't
-        if self._gateway:
-            os.environ[spec.env_key] = api_key
-        else:
-            os.environ.setdefault(spec.env_key, api_key)
-
-        # Resolve env_extras placeholders:
-        #   {api_key}  → user's API key
-        #   {api_base} → user's api_base, falling back to spec.default_api_base
-        effective_base = api_base or spec.default_api_base
-        for env_name, env_val in spec.env_extras:
-            resolved = env_val.replace("{api_key}", api_key)
-            resolved = resolved.replace("{api_base}", effective_base)
-            os.environ.setdefault(env_name, resolved)
-    
-    def _resolve_model(self, model: str) -> str:
-        """Resolve model name by applying provider/gateway prefixes."""
-        if self._gateway:
-            # Gateway mode: apply gateway prefix, skip provider-specific prefixes
-            prefix = self._gateway.litellm_prefix
-            if self._gateway.strip_model_prefix:
-                model = model.split("/")[-1]
-            if prefix and not model.startswith(f"{prefix}/"):
-                model = f"{prefix}/{model}"
-            return model
-        
-        # Standard mode: auto-prefix for known providers
-        spec = find_by_model(model)
-        if spec and spec.litellm_prefix:
-            if not any(model.startswith(s) for s in spec.skip_prefixes):
-                model = f"{spec.litellm_prefix}/{model}"
-        
-        return model
-    
-    def _apply_model_overrides(self, model: str, kwargs: dict[str, Any]) -> None:
-        """Apply model-specific parameter overrides from the registry."""
-        model_lower = model.lower()
-        spec = find_by_model(model)
-        if spec:
-            for pattern, overrides in spec.model_overrides:
-                if pattern in model_lower:
-                    kwargs.update(overrides)
-                    return
     
     async def chat(
         self,
@@ -120,19 +121,66 @@ class LiteLLMProvider(LLMProvider):
         Returns:
             LLMResponse with content and/or tool calls.
         """
-        model = self._resolve_model(model or self.default_model)
+        model = model or self.default_model
+        model_lower = model.lower()
+
+        # Choose API key by the actual requested model first (bot override aware),
+        # then fall back to constructor-level default key.
+        model_provider = None
+        provider_rules = [
+            (("openrouter",), "openrouter"),
+            (("aihubmix",), "aihubmix"),
+            (("deepseek",), "deepseek"),
+            (("anthropic", "claude"), "anthropic"),
+            (("openai", "gpt"), "openai"),
+            (("gemini",), "gemini"),
+            (("zhipu", "glm", "zai"), "zhipu"),
+            (("dashscope", "qwen"), "dashscope"),
+            (("groq",), "groq"),
+            (("moonshot", "kimi"), "moonshot"),
+            (("vllm", "hosted_vllm"), "vllm"),
+        ]
+        for keywords, provider_name in provider_rules:
+            if any(kw in model_lower for kw in keywords):
+                model_provider = provider_name
+                break
+        selected_api_key = self.provider_keys.get(model_provider or "", self.api_key)
         
+        # Auto-prefix model names for known providers
+        # (keywords, target_prefix, skip_if_starts_with)
+        _prefix_rules = [
+            (("glm", "zhipu"), "zai", ("zhipu/", "zai/", "openrouter/", "hosted_vllm/")),
+            (("qwen", "dashscope"), "dashscope", ("dashscope/", "openrouter/")),
+            (("moonshot", "kimi"), "moonshot", ("moonshot/", "openrouter/")),
+            (("gemini",), "gemini", ("gemini/",)),
+        ]
+        for keywords, prefix, skip in _prefix_rules:
+            if any(kw in model_lower for kw in keywords) and not any(model.startswith(s) for s in skip):
+                model = f"{prefix}/{model}"
+                break
+
+        # Gateway/endpoint-specific prefixes (detected by api_base/api_key, not model name)
+        if self.is_openrouter and not model.startswith("openrouter/"):
+            model = f"openrouter/{model}"
+        elif self.is_aihubmix:
+            model = f"openai/{model.split('/')[-1]}"
+        elif self.is_vllm:
+            model = f"hosted_vllm/{model}"
+        
+        # kimi-k2.5 only supports temperature=1.0
+        if "kimi-k2.5" in model.lower():
+            temperature = 1.0
+
         kwargs: dict[str, Any] = {
             "model": model,
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
+        if selected_api_key:
+            kwargs["api_key"] = selected_api_key
         
-        # Apply model-specific overrides (e.g. kimi-k2.5 temperature)
-        self._apply_model_overrides(model, kwargs)
-        
-        # Pass api_base for custom endpoints
+        # Pass api_base directly for custom endpoints (vLLM, etc.)
         if self.api_base:
             kwargs["api_base"] = self.api_base
         
@@ -158,6 +206,7 @@ class LiteLLMProvider(LLMProvider):
         """Parse LiteLLM response into our standard format."""
         choice = response.choices[0]
         message = choice.message
+        assistant_metadata = self._extract_assistant_metadata(message)
         
         tool_calls = []
         if hasattr(message, "tool_calls") and message.tool_calls:
@@ -165,6 +214,7 @@ class LiteLLMProvider(LLMProvider):
                 # Parse arguments from JSON string if needed
                 args = tc.function.arguments
                 if isinstance(args, str):
+                    import json
                     try:
                         args = json.loads(args)
                     except json.JSONDecodeError:
@@ -184,15 +234,46 @@ class LiteLLMProvider(LLMProvider):
                 "total_tokens": response.usage.total_tokens,
             }
         
-        reasoning_content = getattr(message, "reasoning_content", None)
-        
         return LLMResponse(
             content=message.content,
             tool_calls=tool_calls,
             finish_reason=choice.finish_reason or "stop",
             usage=usage,
-            reasoning_content=reasoning_content,
+            assistant_metadata=assistant_metadata,
         )
+
+    def _extract_assistant_metadata(self, message: Any) -> dict[str, Any]:
+        """Extract reasoning/thinking metadata from provider-specific assistant message fields."""
+        metadata: dict[str, Any] = {}
+        # Common names used by Moonshot and other reasoning-capable providers.
+        tracked_fields = (
+            "reasoning_content",
+            "reasoning",
+            "reasoning_text",
+            "reasoning_summary",
+            "reasoning_details",
+            "thinking",
+            "thinking_content",
+        )
+
+        def _get(source: Any, key: str) -> Any:
+            if isinstance(source, dict):
+                return source.get(key)
+            return getattr(source, key, None)
+
+        for key in tracked_fields:
+            value = _get(message, key)
+            if value not in (None, "", [], {}):
+                metadata[key] = value
+
+        model_extra = getattr(message, "model_extra", None)
+        if isinstance(model_extra, dict):
+            for key in tracked_fields:
+                value = model_extra.get(key)
+                if key not in metadata and value not in (None, "", [], {}):
+                    metadata[key] = value
+
+        return metadata
     
     def get_default_model(self) -> str:
         """Get the default model."""

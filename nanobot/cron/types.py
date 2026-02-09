@@ -27,6 +27,7 @@ class CronPayload:
     deliver: bool = False
     channel: str | None = None  # e.g. "whatsapp"
     to: str | None = None  # e.g. phone number
+    user_id: str | None = None  # message sender who created the reminder
 
 
 @dataclass

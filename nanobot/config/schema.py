@@ -112,6 +112,12 @@ class IOSConfig(BaseModel):
     port: int = 8765
     auth_token: str = ""  # Optional shared token from iOS client payload
     allow_from: list[str] = Field(default_factory=list)  # Allowed sender IDs
+    apns_enabled: bool = False
+    apns_team_id: str = ""
+    apns_key_id: str = ""
+    apns_bundle_id: str = ""
+    apns_p8_path: str = ""
+    apns_use_sandbox: bool = True
 
 
 class ChannelsConfig(BaseModel):

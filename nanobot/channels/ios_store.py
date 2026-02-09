@@ -24,6 +24,11 @@ def _default_name(bot_id: str) -> str:
     return pretty.title() if pretty else bot_id
 
 
+def _safe_id(value: str) -> str:
+    normalized = _normalize_token(value)
+    return normalized or "x"
+
+
 @dataclass
 class IOSBotCatalogItem:
     id: str
@@ -61,6 +66,10 @@ class IOSConversationStore:
         self._save()
 
     def snapshot_for(self, sender_id: str) -> dict[str, Any]:
+        changed = self._ensure_direct_conversations_for_sender(sender_id)
+        if changed:
+            self._save()
+
         conversations = [
             conversation
             for conversation in self.data["conversations"].values()
@@ -133,8 +142,6 @@ class IOSConversationStore:
         if created_by not in normalized_members:
             normalized_members.append(created_by)
         normalized_members = sorted(set(normalized_members))
-        if len(normalized_members) < 2 and kind == "group":
-            raise ValueError("group_members_required")
 
         normalized_bots = [b.strip() for b in bot_ids if b and b.strip()]
         normalized_bots = [self.resolve_bot_token(bot) for bot in normalized_bots]
@@ -144,6 +151,11 @@ class IOSConversationStore:
             raise ValueError("bot_limit_exceeded")
         if not normalized_bots:
             raise ValueError("bot_required")
+
+        if kind == "group":
+            total_participants = len(set(normalized_members + normalized_bots))
+            if total_participants < 2:
+                raise ValueError("group_members_required")
 
         conv_id = f"c_{uuid.uuid4().hex[:10]}"
         now = _now_iso()
@@ -172,6 +184,37 @@ class IOSConversationStore:
         conversation["unread_count"] = 0
         conversation["updated_at"] = _now_iso()
         self.data["messages"][conversation_id] = []
+        self._save()
+
+    def rename_conversation(self, conversation_id: str, sender_id: str, title: str) -> dict[str, Any]:
+        conversation = self.data["conversations"].get(conversation_id)
+        if not conversation:
+            raise ValueError("conversation_not_found")
+        if sender_id not in conversation["member_ids"]:
+            raise ValueError("forbidden")
+        if conversation.get("kind") != "group":
+            raise ValueError("direct_conversation_protected")
+
+        title = title.strip()
+        if not title:
+            raise ValueError("invalid_title")
+
+        conversation["title"] = title
+        conversation["updated_at"] = _now_iso()
+        self._save()
+        return conversation
+
+    def delete_conversation(self, conversation_id: str, sender_id: str) -> None:
+        conversation = self.data["conversations"].get(conversation_id)
+        if not conversation:
+            raise ValueError("conversation_not_found")
+        if sender_id not in conversation["member_ids"]:
+            raise ValueError("forbidden")
+        if conversation.get("kind") != "group":
+            raise ValueError("direct_conversation_protected")
+
+        self.data["conversations"].pop(conversation_id, None)
+        self.data["messages"].pop(conversation_id, None)
         self._save()
 
     def ensure_conversation(self, conversation_id: str, sender_id: str, default_bot_id: str | None = None) -> dict[str, Any]:
@@ -351,39 +394,54 @@ class IOSConversationStore:
         self.data.setdefault("conversations", {})
         self.data.setdefault("messages", {})
 
-        # Keep a starter direct chat if store is empty.
-        if self.data["conversations"]:
-            return
+    def _ensure_direct_conversations_for_sender(self, sender_id: str) -> bool:
+        changed = False
+        if not sender_id:
+            return changed
 
-        default_bot = self._first_bot_id()
-        if not default_bot:
-            return
+        existing_by_bot: dict[str, dict[str, Any]] = {}
+        for conversation in self.data["conversations"].values():
+            if conversation.get("kind") != "direct":
+                continue
+            if sender_id not in (conversation.get("member_ids") or []):
+                continue
+            bot_ids = conversation.get("bot_ids") or []
+            if len(bot_ids) != 1:
+                continue
+            bot_id = str(bot_ids[0]).strip()
+            if not bot_id:
+                continue
+            existing_by_bot.setdefault(bot_id, conversation)
 
-        now = _now_iso()
-        conv = {
-            "id": "c_anna",
-            "title": "Anna",
-            "subtitle": "Can you help me with tonight's launch notes?",
-            "kind": "direct",
-            "member_ids": ["u_me", "u_anna"],
-            "bot_ids": [default_bot],
-            "unread_count": 1,
-            "updated_at": now,
-            "created_at": now,
-        }
-        self.data["conversations"][conv["id"]] = conv
-        self.data["messages"][conv["id"]] = [
-            {
-                "id": f"m_{uuid.uuid4().hex}",
-                "conversation_id": conv["id"],
-                "sender_id": "u_anna",
-                "sender_role": "participant",
-                "body": "Can you help me with tonight's launch notes?",
-                "sent_at": now,
-                "is_read": False,
-                "metadata": {},
+        for bot_id, bot in self.bots.items():
+            existing = existing_by_bot.get(bot_id)
+            if existing:
+                title = str(existing.get("title") or "").strip()
+                if title != bot.name:
+                    existing["title"] = bot.name
+                    changed = True
+                continue
+
+            now = _now_iso()
+            conv_id = f"c_dm_{_safe_id(sender_id)}_{_safe_id(bot_id)}"
+            if conv_id in self.data["conversations"]:
+                conv_id = f"{conv_id}_{uuid.uuid4().hex[:6]}"
+
+            self.data["conversations"][conv_id] = {
+                "id": conv_id,
+                "title": bot.name,
+                "subtitle": "No messages yet",
+                "kind": "direct",
+                "member_ids": sorted(set([sender_id, bot_id])),
+                "bot_ids": [bot_id],
+                "unread_count": 0,
+                "updated_at": now,
+                "created_at": now,
             }
-        ]
+            self.data["messages"].setdefault(conv_id, [])
+            changed = True
+
+        return changed
 
     def _first_bot_id(self) -> str | None:
         return next(iter(self.bots.keys()), None)

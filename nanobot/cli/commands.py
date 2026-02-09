@@ -1,19 +1,11 @@
 """CLI commands for nanobot."""
 
 import asyncio
-import atexit
-import os
-import signal
 from pathlib import Path
-import select
-import sys
 
 import typer
 from rich.console import Console
-from rich.markdown import Markdown
-from rich.panel import Panel
 from rich.table import Table
-from rich.text import Text
 
 from nanobot import __version__, __logo__
 
@@ -24,146 +16,6 @@ app = typer.Typer(
 )
 
 console = Console()
-EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
-
-# ---------------------------------------------------------------------------
-# Lightweight CLI input: readline for arrow keys / history, termios for flush
-# ---------------------------------------------------------------------------
-
-_READLINE = None
-_HISTORY_FILE: Path | None = None
-_HISTORY_HOOK_REGISTERED = False
-_USING_LIBEDIT = False
-_SAVED_TERM_ATTRS = None  # original termios settings, restored on exit
-
-
-def _flush_pending_tty_input() -> None:
-    """Drop unread keypresses typed while the model was generating output."""
-    try:
-        fd = sys.stdin.fileno()
-        if not os.isatty(fd):
-            return
-    except Exception:
-        return
-
-    try:
-        import termios
-        termios.tcflush(fd, termios.TCIFLUSH)
-        return
-    except Exception:
-        pass
-
-    try:
-        while True:
-            ready, _, _ = select.select([fd], [], [], 0)
-            if not ready:
-                break
-            if not os.read(fd, 4096):
-                break
-    except Exception:
-        return
-
-
-def _save_history() -> None:
-    if _READLINE is None or _HISTORY_FILE is None:
-        return
-    try:
-        _READLINE.write_history_file(str(_HISTORY_FILE))
-    except Exception:
-        return
-
-
-def _restore_terminal() -> None:
-    """Restore terminal to its original state (echo, line buffering, etc.)."""
-    if _SAVED_TERM_ATTRS is None:
-        return
-    try:
-        import termios
-        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, _SAVED_TERM_ATTRS)
-    except Exception:
-        pass
-
-
-def _enable_line_editing() -> None:
-    """Enable readline for arrow keys, line editing, and persistent history."""
-    global _READLINE, _HISTORY_FILE, _HISTORY_HOOK_REGISTERED, _USING_LIBEDIT, _SAVED_TERM_ATTRS
-
-    # Save terminal state before readline touches it
-    try:
-        import termios
-        _SAVED_TERM_ATTRS = termios.tcgetattr(sys.stdin.fileno())
-    except Exception:
-        pass
-
-    history_file = Path.home() / ".nanobot" / "history" / "cli_history"
-    history_file.parent.mkdir(parents=True, exist_ok=True)
-    _HISTORY_FILE = history_file
-
-    try:
-        import readline
-    except ImportError:
-        return
-
-    _READLINE = readline
-    _USING_LIBEDIT = "libedit" in (readline.__doc__ or "").lower()
-
-    try:
-        if _USING_LIBEDIT:
-            readline.parse_and_bind("bind ^I rl_complete")
-        else:
-            readline.parse_and_bind("tab: complete")
-        readline.parse_and_bind("set editing-mode emacs")
-    except Exception:
-        pass
-
-    try:
-        readline.read_history_file(str(history_file))
-    except Exception:
-        pass
-
-    if not _HISTORY_HOOK_REGISTERED:
-        atexit.register(_save_history)
-        _HISTORY_HOOK_REGISTERED = True
-
-
-def _prompt_text() -> str:
-    """Build a readline-friendly colored prompt."""
-    if _READLINE is None:
-        return "You: "
-    # libedit on macOS does not honor GNU readline non-printing markers.
-    if _USING_LIBEDIT:
-        return "\033[1;34mYou:\033[0m "
-    return "\001\033[1;34m\002You:\001\033[0m\002 "
-
-
-def _print_agent_response(response: str, render_markdown: bool) -> None:
-    """Render assistant response with consistent terminal styling."""
-    content = response or ""
-    body = Markdown(content) if render_markdown else Text(content)
-    console.print()
-    console.print(
-        Panel(
-            body,
-            title=f"{__logo__} nanobot",
-            title_align="left",
-            border_style="cyan",
-            padding=(0, 1),
-        )
-    )
-    console.print()
-
-
-def _is_exit_command(command: str) -> bool:
-    """Return True when input should end interactive chat."""
-    return command.lower() in EXIT_COMMANDS
-
-
-async def _read_interactive_input_async() -> str:
-    """Read user input with arrow keys and history (runs input() in a thread)."""
-    try:
-        return await asyncio.to_thread(input, _prompt_text())
-    except EOFError as exc:
-        raise KeyboardInterrupt from exc
 
 
 def version_callback(value: bool):
@@ -309,7 +161,19 @@ def _make_provider(config):
         api_base=config.get_api_base(),
         default_model=model,
         extra_headers=p.extra_headers if p else None,
-        provider_name=config.get_provider_name(),
+        provider_keys={
+            "openrouter": config.providers.openrouter.api_key,
+            "anthropic": config.providers.anthropic.api_key,
+            "openai": config.providers.openai.api_key,
+            "deepseek": config.providers.deepseek.api_key,
+            "gemini": config.providers.gemini.api_key,
+            "zhipu": config.providers.zhipu.api_key,
+            "dashscope": config.providers.dashscope.api_key,
+            "groq": config.providers.groq.api_key,
+            "moonshot": config.providers.moonshot.api_key,
+            "aihubmix": config.providers.aihubmix.api_key,
+            "vllm": config.providers.vllm.api_key,
+        },
     )
 
 
@@ -328,10 +192,10 @@ def gateway(
     from nanobot.bus.queue import MessageBus
     from nanobot.agent.loop import AgentLoop
     from nanobot.channels.manager import ChannelManager
-    from nanobot.session.manager import SessionManager
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronJob
     from nanobot.heartbeat.service import HeartbeatService
+    from loguru import logger
     
     if verbose:
         import logging
@@ -342,7 +206,28 @@ def gateway(
     config = load_config()
     bus = MessageBus()
     provider = _make_provider(config)
-    session_manager = SessionManager(config.workspace_path)
+
+    ios_reminder_notifier = None
+    if config.channels.ios.apns_enabled:
+        try:
+            from nanobot.channels.ios_push_store import IOSPushDeviceStore
+            from nanobot.push.apns import APNsClient
+            from nanobot.push.reminder import IOSReminderNotifier
+
+            apns = APNsClient(
+                team_id=config.channels.ios.apns_team_id,
+                key_id=config.channels.ios.apns_key_id,
+                bundle_id=config.channels.ios.apns_bundle_id,
+                p8_path=config.channels.ios.apns_p8_path,
+                use_sandbox=config.channels.ios.apns_use_sandbox,
+            )
+            ios_reminder_notifier = IOSReminderNotifier(
+                device_store=IOSPushDeviceStore(workspace=config.workspace_path),
+                apns_client=apns,
+            )
+            console.print("[green]✓[/green] iOS APNs reminder push enabled")
+        except Exception as e:
+            console.print(f"[yellow]Warning: APNs disabled ({e})[/yellow]")
     
     # Create cron service first (callback set after agent creation)
     cron_store_path = get_data_dir() / "cron" / "jobs.json"
@@ -359,7 +244,6 @@ def gateway(
         exec_config=config.tools.exec,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
-        session_manager=session_manager,
         bot_models={
             bot_id: bot.model
             for bot_id, bot in config.agents.bots.items()
@@ -381,6 +265,30 @@ def gateway(
             channel=job.payload.channel or "cli",
             chat_id=job.payload.to or "direct",
         )
+        if (
+            ios_reminder_notifier
+            and job.payload.channel == "ios"
+            and job.payload.user_id
+            and job.payload.message
+        ):
+            result = await ios_reminder_notifier.notify_user_reminder(
+                user_id=job.payload.user_id,
+                message=job.payload.message,
+                conversation_id=job.payload.to,
+            )
+            logger.info(
+                "Cron APNs reminder result "
+                f"job={job.id} user={job.payload.user_id} "
+                f"conversation={job.payload.to or '-'} "
+                f"sent={result.get('sent', 0)} failed={result.get('failed', 0)}"
+            )
+        elif job.payload.channel == "ios":
+            if not ios_reminder_notifier:
+                logger.warning(f"Cron APNs reminder skipped job={job.id} reason=notifier_disabled")
+            elif not job.payload.user_id:
+                logger.warning(f"Cron APNs reminder skipped job={job.id} reason=missing_user_id")
+            elif not job.payload.message:
+                logger.warning(f"Cron APNs reminder skipped job={job.id} reason=empty_message")
         if job.payload.deliver and job.payload.to:
             from nanobot.bus.events import OutboundMessage
             await bus.publish_outbound(OutboundMessage(
@@ -404,7 +312,7 @@ def gateway(
     )
     
     # Create channel manager
-    channels = ChannelManager(config, bus, session_manager=session_manager)
+    channels = ChannelManager(config, bus)
     
     if channels.enabled_channels:
         console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
@@ -446,24 +354,16 @@ def gateway(
 def agent(
     message: str = typer.Option(None, "--message", "-m", help="Message to send to the agent"),
     session_id: str = typer.Option("cli:default", "--session", "-s", help="Session ID"),
-    markdown: bool = typer.Option(True, "--markdown/--no-markdown", help="Render assistant output as Markdown"),
-    logs: bool = typer.Option(False, "--logs/--no-logs", help="Show nanobot runtime logs during chat"),
 ):
     """Interact with the agent directly."""
     from nanobot.config.loader import load_config
     from nanobot.bus.queue import MessageBus
     from nanobot.agent.loop import AgentLoop
-    from loguru import logger
     
     config = load_config()
     
     bus = MessageBus()
     provider = _make_provider(config)
-
-    if logs:
-        logger.enable("nanobot")
-    else:
-        logger.disable("nanobot")
     
     agent_loop = AgentLoop(
         bus=bus,
@@ -484,62 +384,27 @@ def agent(
         },
     )
     
-    # Show spinner when logs are off (no output to miss); skip when logs are on
-    def _thinking_ctx():
-        if logs:
-            from contextlib import nullcontext
-            return nullcontext()
-        return console.status("[dim]nanobot is thinking...[/dim]", spinner="dots")
-
     if message:
         # Single message mode
         async def run_once():
-            with _thinking_ctx():
-                response = await agent_loop.process_direct(message, session_id)
-            _print_agent_response(response, render_markdown=markdown)
+            response = await agent_loop.process_direct(message, session_id)
+            console.print(f"\n{__logo__} {response}")
         
         asyncio.run(run_once())
     else:
         # Interactive mode
-        _enable_line_editing()
-        console.print(f"{__logo__} Interactive mode (type [bold]exit[/bold] or [bold]Ctrl+C[/bold] to quit)\n")
-
-        # input() runs in a worker thread that can't be cancelled.
-        # Without this handler, asyncio.run() would hang waiting for it.
-        def _exit_on_sigint(signum, frame):
-            _save_history()
-            _restore_terminal()
-            console.print("\nGoodbye!")
-            os._exit(0)
-
-        signal.signal(signal.SIGINT, _exit_on_sigint)
+        console.print(f"{__logo__} Interactive mode (Ctrl+C to exit)\n")
         
         async def run_interactive():
             while True:
                 try:
-                    _flush_pending_tty_input()
-                    user_input = await _read_interactive_input_async()
-                    command = user_input.strip()
-                    if not command:
+                    user_input = console.input("[bold blue]You:[/bold blue] ")
+                    if not user_input.strip():
                         continue
-
-                    if _is_exit_command(command):
-                        _save_history()
-                        _restore_terminal()
-                        console.print("\nGoodbye!")
-                        break
                     
-                    with _thinking_ctx():
-                        response = await agent_loop.process_direct(user_input, session_id)
-                    _print_agent_response(response, render_markdown=markdown)
+                    response = await agent_loop.process_direct(user_input, session_id)
+                    console.print(f"\n{__logo__} {response}\n")
                 except KeyboardInterrupt:
-                    _save_history()
-                    _restore_terminal()
-                    console.print("\nGoodbye!")
-                    break
-                except EOFError:
-                    _save_history()
-                    _restore_terminal()
                     console.print("\nGoodbye!")
                     break
         
@@ -589,15 +454,6 @@ def channels_status():
         "Telegram",
         "✓" if tg.enabled else "✗",
         tg_config
-    )
-
-    # Slack
-    slack = config.channels.slack
-    slack_config = "socket" if slack.app_token and slack.bot_token else "[dim]not configured[/dim]"
-    table.add_row(
-        "Slack",
-        "✓" if slack.enabled else "✗",
-        slack_config
     )
 
     ios = config.channels.ios
@@ -866,24 +722,25 @@ def status():
     console.print(f"Workspace: {workspace} {'[green]✓[/green]' if workspace.exists() else '[red]✗[/red]'}")
 
     if config_path.exists():
-        from nanobot.providers.registry import PROVIDERS
-
         console.print(f"Model: {config.agents.defaults.model}")
         
-        # Check API keys from registry
-        for spec in PROVIDERS:
-            p = getattr(config.providers, spec.name, None)
-            if p is None:
-                continue
-            if spec.is_local:
-                # Local deployments show api_base instead of api_key
-                if p.api_base:
-                    console.print(f"{spec.label}: [green]✓ {p.api_base}[/green]")
-                else:
-                    console.print(f"{spec.label}: [dim]not set[/dim]")
-            else:
-                has_key = bool(p.api_key)
-                console.print(f"{spec.label}: {'[green]✓[/green]' if has_key else '[dim]not set[/dim]'}")
+        # Check API keys
+        has_openrouter = bool(config.providers.openrouter.api_key)
+        has_anthropic = bool(config.providers.anthropic.api_key)
+        has_openai = bool(config.providers.openai.api_key)
+        has_gemini = bool(config.providers.gemini.api_key)
+        has_zhipu = bool(config.providers.zhipu.api_key)
+        has_vllm = bool(config.providers.vllm.api_base)
+        has_aihubmix = bool(config.providers.aihubmix.api_key)
+        
+        console.print(f"OpenRouter API: {'[green]✓[/green]' if has_openrouter else '[dim]not set[/dim]'}")
+        console.print(f"Anthropic API: {'[green]✓[/green]' if has_anthropic else '[dim]not set[/dim]'}")
+        console.print(f"OpenAI API: {'[green]✓[/green]' if has_openai else '[dim]not set[/dim]'}")
+        console.print(f"Gemini API: {'[green]✓[/green]' if has_gemini else '[dim]not set[/dim]'}")
+        console.print(f"Zhipu AI API: {'[green]✓[/green]' if has_zhipu else '[dim]not set[/dim]'}")
+        console.print(f"AiHubMix API: {'[green]✓[/green]' if has_aihubmix else '[dim]not set[/dim]'}")
+        vllm_status = f"[green]✓ {config.providers.vllm.api_base}[/green]" if has_vllm else "[dim]not set[/dim]"
+        console.print(f"vLLM/Local: {vllm_status}")
 
 
 if __name__ == "__main__":

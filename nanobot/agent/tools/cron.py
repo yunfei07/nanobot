@@ -1,5 +1,6 @@
 """Cron tool for scheduling reminders and tasks."""
 
+from datetime import datetime, timezone
 from typing import Any
 
 from nanobot.agent.tools.base import Tool
@@ -14,11 +15,13 @@ class CronTool(Tool):
         self._cron = cron_service
         self._channel = ""
         self._chat_id = ""
+        self._sender_id = ""
     
-    def set_context(self, channel: str, chat_id: str) -> None:
+    def set_context(self, channel: str, chat_id: str, sender_id: str = "") -> None:
         """Set the current session context for delivery."""
         self._channel = channel
         self._chat_id = chat_id
+        self._sender_id = sender_id
     
     @property
     def name(self) -> str:
@@ -26,7 +29,7 @@ class CronTool(Tool):
     
     @property
     def description(self) -> str:
-        return "Schedule reminders and recurring tasks. Actions: add, list, remove."
+        return "Schedule reminders and recurring tasks. Actions: add, list, remove. Supports every_seconds, cron_expr, or one-shot at."
     
     @property
     def parameters(self) -> dict[str, Any]:
@@ -50,6 +53,10 @@ class CronTool(Tool):
                     "type": "string",
                     "description": "Cron expression like '0 9 * * *' (for scheduled tasks)"
                 },
+                "at": {
+                    "type": "string",
+                    "description": "One-shot run time in ISO format (e.g. '2026-02-09T09:00:00+08:00')"
+                },
                 "job_id": {
                     "type": "string",
                     "description": "Job ID (for remove)"
@@ -64,30 +71,50 @@ class CronTool(Tool):
         message: str = "",
         every_seconds: int | None = None,
         cron_expr: str | None = None,
+        at: str | None = None,
         job_id: str | None = None,
         **kwargs: Any
     ) -> str:
         if action == "add":
-            return self._add_job(message, every_seconds, cron_expr)
+            return self._add_job(message, every_seconds, cron_expr, at)
         elif action == "list":
             return self._list_jobs()
         elif action == "remove":
             return self._remove_job(job_id)
         return f"Unknown action: {action}"
     
-    def _add_job(self, message: str, every_seconds: int | None, cron_expr: str | None) -> str:
+    def _add_job(
+        self,
+        message: str,
+        every_seconds: int | None,
+        cron_expr: str | None,
+        at: str | None,
+    ) -> str:
         if not message:
             return "Error: message is required for add"
         if not self._channel or not self._chat_id:
             return "Error: no session context (channel/chat_id)"
-        
+
+        provided = int(bool(every_seconds)) + int(bool(cron_expr)) + int(bool(at))
+        if provided == 0:
+            return "Error: one of every_seconds, cron_expr, or at is required"
+        if provided > 1:
+            return "Error: only one of every_seconds, cron_expr, or at can be set"
+
         # Build schedule
         if every_seconds:
             schedule = CronSchedule(kind="every", every_ms=every_seconds * 1000)
         elif cron_expr:
             schedule = CronSchedule(kind="cron", expr=cron_expr)
+        elif at:
+            at_ms = self._parse_at_to_ms(at)
+            if at_ms is None:
+                return "Error: invalid at format. Use ISO datetime like 2026-02-09T09:00:00+08:00"
+            if at_ms <= int(datetime.now(timezone.utc).timestamp() * 1000):
+                return "Error: at must be in the future"
+            schedule = CronSchedule(kind="at", at_ms=at_ms)
         else:
-            return "Error: either every_seconds or cron_expr is required"
+            return "Error: failed to build schedule"
         
         job = self._cron.add_job(
             name=message[:30],
@@ -96,6 +123,7 @@ class CronTool(Tool):
             deliver=True,
             channel=self._channel,
             to=self._chat_id,
+            user_id=self._sender_id or None,
         )
         return f"Created job '{job.name}' (id: {job.id})"
     
@@ -112,3 +140,18 @@ class CronTool(Tool):
         if self._cron.remove_job(job_id):
             return f"Removed job {job_id}"
         return f"Job {job_id} not found"
+
+    @staticmethod
+    def _parse_at_to_ms(value: str) -> int | None:
+        text = value.strip()
+        if not text:
+            return None
+        text = text.replace("Z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            local_tz = datetime.now().astimezone().tzinfo
+            dt = dt.replace(tzinfo=local_tz)
+        return int(dt.timestamp() * 1000)

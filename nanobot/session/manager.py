@@ -24,6 +24,18 @@ class Session:
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
     metadata: dict[str, Any] = field(default_factory=dict)
+    _HISTORY_OPTIONAL_FIELDS: tuple[str, ...] = (
+        "tool_calls",
+        "tool_call_id",
+        "name",
+        "reasoning_content",
+        "reasoning",
+        "reasoning_text",
+        "reasoning_summary",
+        "reasoning_details",
+        "thinking",
+        "thinking_content",
+    )
     
     def add_message(self, role: str, content: str, **kwargs: Any) -> None:
         """Add a message to the session."""
@@ -49,8 +61,18 @@ class Session:
         # Get recent messages
         recent = self.messages[-max_messages:] if len(self.messages) > max_messages else self.messages
         
-        # Convert to LLM format (just role and content)
-        return [{"role": m["role"], "content": m["content"]} for m in recent]
+        history: list[dict[str, Any]] = []
+        for message in recent:
+            record: dict[str, Any] = {
+                "role": message["role"],
+                "content": message["content"],
+            }
+            for field in self._HISTORY_OPTIONAL_FIELDS:
+                if field in message and message[field] is not None:
+                    record[field] = message[field]
+            history.append(record)
+
+        return history
     
     def clear(self) -> None:
         """Clear all messages in the session."""

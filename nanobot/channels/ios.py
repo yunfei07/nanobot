@@ -13,6 +13,7 @@ from websockets.server import WebSocketServerProtocol
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
+from nanobot.channels.ios_push_store import IOSPushDeviceStore
 from nanobot.channels.ios_store import IOSConversationStore
 from nanobot.config.schema import IOSConfig
 
@@ -36,6 +37,7 @@ class IOSChannel(BaseChannel):
         self._clients: set[WebSocketServerProtocol] = set()
         self._chat_clients: dict[str, set[WebSocketServerProtocol]] = {}
         self.store = IOSConversationStore(workspace=workspace, bot_profiles=bot_profiles)
+        self.push_store = IOSPushDeviceStore(workspace=workspace)
 
     async def start(self) -> None:
         self._running = True
@@ -72,6 +74,7 @@ class IOSChannel(BaseChannel):
     async def send(self, msg: OutboundMessage) -> None:
         metadata = dict(msg.metadata or {})
         bot_id = str(metadata.get("bot_id") or "")
+        sent_at = None
         if bot_id:
             try:
                 stored = self.store.append_bot_message(
@@ -81,6 +84,7 @@ class IOSChannel(BaseChannel):
                     metadata=metadata,
                 )
                 metadata["message_id"] = stored["id"]
+                sent_at = stored.get("sent_at")
             except Exception:
                 pass
 
@@ -95,6 +99,8 @@ class IOSChannel(BaseChannel):
             "content": msg.content,
             "replyTo": msg.reply_to,
             "replyToClientMessageId": metadata.get("client_request_id"),
+            "sentAt": sent_at,
+            "sent_at": sent_at,
             "metadata": metadata,
         }
 
@@ -160,8 +166,24 @@ class IOSChannel(BaseChannel):
             await self._handle_clear_history(ws, data, request_id=request_id)
             return
 
+        if msg_type in {"renameconversation", "rename_conversation"}:
+            await self._handle_rename_conversation(ws, data, request_id=request_id)
+            return
+
+        if msg_type in {"deleteconversation", "delete_conversation"}:
+            await self._handle_delete_conversation(ws, data, request_id=request_id)
+            return
+
         if msg_type == "send":
             await self._handle_send(ws, data, request_id=request_id)
+            return
+
+        if msg_type in {"registerdevice", "register_device"}:
+            await self._handle_register_device(ws, data, request_id=request_id)
+            return
+
+        if msg_type in {"unregisterdevice", "unregister_device"}:
+            await self._handle_unregister_device(ws, data, request_id=request_id)
             return
 
         await self._send_error(ws, f"unsupported_type:{msg_type}", request_id=request_id)
@@ -225,16 +247,7 @@ class IOSChannel(BaseChannel):
             {
                 "type": "conversation_created",
                 "requestId": request_id,
-                "conversation": {
-                    "id": conversation["id"],
-                    "title": conversation["title"],
-                    "subtitle": conversation["subtitle"],
-                    "kind": conversation["kind"],
-                    "memberIDs": conversation["member_ids"],
-                    "botIDs": conversation["bot_ids"],
-                    "unreadCount": conversation["unread_count"],
-                    "updatedAt": conversation["updated_at"],
-                },
+                "conversation": self._serialize_conversation(conversation),
             },
         )
 
@@ -262,6 +275,67 @@ class IOSChannel(BaseChannel):
 
         self.store.clear_history(chat_id)
         await self._send_json(ws, {"type": "ack", "event": "clear_history", "requestId": request_id})
+
+    async def _handle_rename_conversation(self, ws: WebSocketServerProtocol, data: dict[str, Any], request_id: str) -> None:
+        if not self._is_authorized(data):
+            await self._send_error(ws, "unauthorized", request_id=request_id)
+            return
+
+        sender_id = str(data.get("senderId") or data.get("sender_id") or "")
+        chat_id = str(data.get("chatId") or data.get("chat_id") or "")
+        title = str(data.get("title") or "")
+        if not sender_id or not chat_id or not title:
+            await self._send_error(ws, "missing_fields:senderId/chatId/title", request_id=request_id)
+            return
+        if not self.is_allowed(sender_id):
+            await self._send_error(ws, "forbidden", request_id=request_id)
+            return
+
+        try:
+            conversation = self.store.rename_conversation(chat_id, sender_id, title)
+        except ValueError as e:
+            await self._send_error(ws, str(e), request_id=request_id)
+            return
+
+        await self._send_json(
+            ws,
+            {
+                "type": "conversation_updated",
+                "requestId": request_id,
+                "conversation": self._serialize_conversation(conversation),
+            },
+        )
+
+    async def _handle_delete_conversation(self, ws: WebSocketServerProtocol, data: dict[str, Any], request_id: str) -> None:
+        if not self._is_authorized(data):
+            await self._send_error(ws, "unauthorized", request_id=request_id)
+            return
+
+        sender_id = str(data.get("senderId") or data.get("sender_id") or "")
+        chat_id = str(data.get("chatId") or data.get("chat_id") or "")
+        if not sender_id or not chat_id:
+            await self._send_error(ws, "missing_fields:senderId/chatId", request_id=request_id)
+            return
+        if not self.is_allowed(sender_id):
+            await self._send_error(ws, "forbidden", request_id=request_id)
+            return
+
+        try:
+            self.store.delete_conversation(chat_id, sender_id)
+        except ValueError as e:
+            await self._send_error(ws, str(e), request_id=request_id)
+            return
+
+        self._chat_clients.pop(chat_id, None)
+        await self._send_json(
+            ws,
+            {
+                "type": "ack",
+                "event": "delete_conversation",
+                "requestId": request_id,
+                "chatId": chat_id,
+            },
+        )
 
     async def _handle_send(self, ws: WebSocketServerProtocol, data: dict[str, Any], request_id: str) -> None:
         if not self._is_authorized(data):
@@ -308,19 +382,7 @@ class IOSChannel(BaseChannel):
         incoming_meta = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
         conversation_type = data.get("conversationType") or data.get("conversation_type") or conversation["kind"]
 
-        for bot_id in target_bot_ids:
-            metadata: dict[str, Any] = dict(incoming_meta)
-            metadata["bot_id"] = bot_id
-            metadata["client_request_id"] = request_id
-            metadata["conversation_type"] = str(conversation_type)
-            await self._handle_message(
-                sender_id=sender_id,
-                chat_id=chat_id,
-                content=content,
-                media=[],
-                metadata=metadata,
-            )
-
+        # Acknowledge receipt first so client doesn't block on long-running bot processing.
         await self._send_json(
             ws,
             {
@@ -328,6 +390,110 @@ class IOSChannel(BaseChannel):
                 "event": "send",
                 "requestId": request_id,
                 "targetBotIds": target_bot_ids,
+            },
+        )
+
+        for bot_id in target_bot_ids:
+            metadata: dict[str, Any] = dict(incoming_meta)
+            metadata["bot_id"] = bot_id
+            metadata["client_request_id"] = request_id
+            metadata["conversation_type"] = str(conversation_type)
+            asyncio.create_task(
+                self._dispatch_bot_message(
+                    sender_id=sender_id,
+                    chat_id=chat_id,
+                    content=content,
+                    metadata=metadata,
+                )
+            )
+
+    async def _dispatch_bot_message(
+        self,
+        *,
+        sender_id: str,
+        chat_id: str,
+        content: str,
+        metadata: dict[str, Any],
+    ) -> None:
+        try:
+            await self._handle_message(
+                sender_id=sender_id,
+                chat_id=chat_id,
+                content=content,
+                media=[],
+                metadata=metadata,
+            )
+        except Exception as e:
+            logger.error(f"iOS dispatch failed for chat_id={chat_id}: {e}")
+
+    async def _handle_register_device(self, ws: WebSocketServerProtocol, data: dict[str, Any], request_id: str) -> None:
+        if not self._is_authorized(data):
+            await self._send_error(ws, "unauthorized", request_id=request_id)
+            return
+
+        sender_id = str(data.get("senderId") or data.get("sender_id") or "").strip()
+        device_token = str(data.get("deviceToken") or data.get("device_token") or "").strip()
+        platform = str(data.get("platform") or "ios").strip() or "ios"
+
+        if not sender_id or not device_token:
+            await self._send_error(ws, "missing_fields:senderId/deviceToken", request_id=request_id)
+            return
+        if not self.is_allowed(sender_id):
+            await self._send_error(ws, "forbidden", request_id=request_id)
+            return
+        if not re.fullmatch(r"[0-9a-fA-F]{64,200}", device_token):
+            await self._send_error(ws, "invalid_device_token", request_id=request_id)
+            return
+
+        self.push_store.register_device(
+            user_id=sender_id,
+            device_token=device_token,
+            platform=platform.lower(),
+        )
+        token_preview = f"{device_token[:8]}...{device_token[-6:]}" if len(device_token) >= 20 else "***"
+        logger.info(
+            f"iOS device registered user={sender_id} platform={platform.lower()} token={token_preview}"
+        )
+        await self._send_json(
+            ws,
+            {
+                "type": "ack",
+                "event": "register_device",
+                "requestId": request_id,
+            },
+        )
+
+    async def _handle_unregister_device(
+        self,
+        ws: WebSocketServerProtocol,
+        data: dict[str, Any],
+        request_id: str,
+    ) -> None:
+        if not self._is_authorized(data):
+            await self._send_error(ws, "unauthorized", request_id=request_id)
+            return
+
+        sender_id = str(data.get("senderId") or data.get("sender_id") or "").strip()
+        device_token = str(data.get("deviceToken") or data.get("device_token") or "").strip()
+        if not sender_id or not device_token:
+            await self._send_error(ws, "missing_fields:senderId/deviceToken", request_id=request_id)
+            return
+        if not self.is_allowed(sender_id):
+            await self._send_error(ws, "forbidden", request_id=request_id)
+            return
+
+        removed = self.push_store.unregister_device(user_id=sender_id, device_token=device_token)
+        token_preview = f"{device_token[:8]}...{device_token[-6:]}" if len(device_token) >= 20 else "***"
+        if removed:
+            logger.info(f"iOS device unregistered user={sender_id} token={token_preview}")
+        else:
+            logger.warning(f"iOS device unregister miss user={sender_id} token={token_preview}")
+        await self._send_json(
+            ws,
+            {
+                "type": "ack",
+                "event": "unregister_device",
+                "requestId": request_id,
             },
         )
 
@@ -411,3 +577,16 @@ class IOSChannel(BaseChannel):
             if normalized:
                 cleaned.append(normalized)
         return cleaned
+
+    @staticmethod
+    def _serialize_conversation(conversation: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": conversation["id"],
+            "title": conversation["title"],
+            "subtitle": conversation["subtitle"],
+            "kind": conversation["kind"],
+            "memberIDs": conversation["member_ids"],
+            "botIDs": conversation["bot_ids"],
+            "unreadCount": conversation["unread_count"],
+            "updatedAt": conversation["updated_at"],
+        }

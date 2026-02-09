@@ -208,7 +208,7 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
         messages: list[dict[str, Any]],
         content: str | None,
         tool_calls: list[dict[str, Any]] | None = None,
-        reasoning_content: str | None = None,
+        assistant_metadata: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Add an assistant message to the message list.
@@ -217,7 +217,7 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
             messages: Current message list.
             content: Message content.
             tool_calls: Optional tool calls.
-            reasoning_content: Thinking output (Kimi, DeepSeek-R1, etc.).
+            assistant_metadata: Optional provider-specific assistant fields.
         
         Returns:
             Updated message list.
@@ -226,10 +226,13 @@ When remembering something, write to {workspace_path}/memory/MEMORY.md"""
         
         if tool_calls:
             msg["tool_calls"] = tool_calls
-        
-        # Thinking models reject history without this
-        if reasoning_content:
-            msg["reasoning_content"] = reasoning_content
+        if assistant_metadata:
+            for key, value in assistant_metadata.items():
+                # Never allow metadata to overwrite core OpenAI message keys.
+                if key in {"role", "content", "tool_calls"}:
+                    continue
+                if value is not None:
+                    msg[key] = value
         
         messages.append(msg)
         return messages
