@@ -179,7 +179,7 @@ class LiteLLMProvider(LLMProvider):
         }
         if selected_api_key:
             kwargs["api_key"] = selected_api_key
-        
+
         # Pass api_base directly for custom endpoints (vLLM, etc.)
         if self.api_base:
             kwargs["api_base"] = self.api_base
