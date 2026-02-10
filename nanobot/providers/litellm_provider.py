@@ -13,8 +13,9 @@ class LiteLLMProvider(LLMProvider):
     """
     LLM provider using LiteLLM for multi-provider support.
     
-    Supports OpenRouter, Anthropic, OpenAI, Gemini, and many other providers through
-    a unified interface.
+    Supports OpenRouter, Anthropic, OpenAI, Gemini, MiniMax, and many other providers through
+    a unified interface.  Provider-specific logic is driven by the registry
+    (see providers/registry.py) — no if-elif chains needed here.
     """
     
     def __init__(
