@@ -1,11 +1,22 @@
 """CLI commands for nanobot."""
 
 import asyncio
+import os
+import select
+import signal
+import sys
 from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.markdown import Markdown
 from rich.table import Table
+from rich.text import Text
+
+from prompt_toolkit import PromptSession
+from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.history import FileHistory
+from prompt_toolkit.patch_stdout import patch_stdout
 
 from nanobot import __version__, __logo__
 
@@ -16,6 +27,108 @@ app = typer.Typer(
 )
 
 console = Console()
+EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
+
+# ---------------------------------------------------------------------------
+# CLI input: prompt_toolkit for editing, paste, history, and display
+# ---------------------------------------------------------------------------
+
+_PROMPT_SESSION: PromptSession | None = None
+_SAVED_TERM_ATTRS = None  # original termios settings, restored on exit
+
+
+def _flush_pending_tty_input() -> None:
+    """Drop unread keypresses typed while the model was generating output."""
+    try:
+        fd = sys.stdin.fileno()
+        if not os.isatty(fd):
+            return
+    except Exception:
+        return
+
+    try:
+        import termios
+        termios.tcflush(fd, termios.TCIFLUSH)
+        return
+    except Exception:
+        pass
+
+    try:
+        while True:
+            ready, _, _ = select.select([fd], [], [], 0)
+            if not ready:
+                break
+            if not os.read(fd, 4096):
+                break
+    except Exception:
+        return
+
+
+def _restore_terminal() -> None:
+    """Restore terminal to its original state (echo, line buffering, etc.)."""
+    if _SAVED_TERM_ATTRS is None:
+        return
+    try:
+        import termios
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, _SAVED_TERM_ATTRS)
+    except Exception:
+        pass
+
+
+def _init_prompt_session() -> None:
+    """Create the prompt_toolkit session with persistent file history."""
+    global _PROMPT_SESSION, _SAVED_TERM_ATTRS
+
+    # Save terminal state so we can restore it on exit
+    try:
+        import termios
+        _SAVED_TERM_ATTRS = termios.tcgetattr(sys.stdin.fileno())
+    except Exception:
+        pass
+
+    history_file = Path.home() / ".nanobot" / "history" / "cli_history"
+    history_file.parent.mkdir(parents=True, exist_ok=True)
+
+    _PROMPT_SESSION = PromptSession(
+        history=FileHistory(str(history_file)),
+        enable_open_in_editor=False,
+        multiline=False,   # Enter submits (single line mode)
+    )
+
+
+def _print_agent_response(response: str, render_markdown: bool) -> None:
+    """Render assistant response with consistent terminal styling."""
+    content = response or ""
+    body = Markdown(content) if render_markdown else Text(content)
+    console.print()
+    console.print(f"[cyan]{__logo__} nanobot[/cyan]")
+    console.print(body)
+    console.print()
+
+
+def _is_exit_command(command: str) -> bool:
+    """Return True when input should end interactive chat."""
+    return command.lower() in EXIT_COMMANDS
+
+
+async def _read_interactive_input_async() -> str:
+    """Read user input using prompt_toolkit (handles paste, history, display).
+
+    prompt_toolkit natively handles:
+    - Multiline paste (bracketed paste mode)
+    - History navigation (up/down arrows)
+    - Clean display (no ghost characters or artifacts)
+    """
+    if _PROMPT_SESSION is None:
+        raise RuntimeError("Call _init_prompt_session() first")
+    try:
+        with patch_stdout():
+            return await _PROMPT_SESSION.prompt_async(
+                HTML("<b fg='ansiblue'>You:</b> "),
+            )
+    except EOFError as exc:
+        raise KeyboardInterrupt from exc
+
 
 
 def version_callback(value: bool):
@@ -42,21 +155,21 @@ def main(
 @app.command()
 def onboard():
     """Initialize nanobot configuration and workspace."""
-    from nanobot.config.loader import get_config_path, save_config
+    from nanobot.config.loader import get_config_path, load_config, save_config
     from nanobot.config.schema import Config
     from nanobot.utils.helpers import get_workspace_path
     
     config_path = get_config_path()
     
     if config_path.exists():
-        console.print(f"[yellow]Config already exists at {config_path}[/yellow]")
-        if not typer.confirm("Overwrite?"):
-            raise typer.Exit()
-    
-    # Create default config
-    config = Config()
-    save_config(config)
-    console.print(f"[green]✓[/green] Created config at {config_path}")
+        # Load existing config — Pydantic fills in defaults for any new fields
+        config = load_config()
+        save_config(config)
+        console.print(f"[green]✓[/green] Config refreshed at {config_path} (existing values preserved)")
+    else:
+        config = Config()
+        save_config(config)
+        console.print(f"[green]✓[/green] Created config at {config_path}")
     
     # Create workspace
     workspace = get_workspace_path()
@@ -87,7 +200,7 @@ You are a helpful AI assistant. Be concise, accurate, and friendly.
 - Always explain what you're doing before taking actions
 - Ask for clarification when the request is ambiguous
 - Use tools to help accomplish tasks
-- Remember important information in your memory files
+- Remember important information in memory/MEMORY.md; past events are logged in memory/HISTORY.md
 """,
         "SOUL.md": """# Soul
 
@@ -145,6 +258,11 @@ This file stores important information that should persist across sessions.
 (Things to remember)
 """)
         console.print("  [dim]Created memory/MEMORY.md[/dim]")
+    
+    history_file = memory_dir / "HISTORY.md"
+    if not history_file.exists():
+        history_file.write_text("")
+        console.print("  [dim]Created memory/HISTORY.md[/dim]")
 
     # Create skills directory for custom user skills
     skills_dir = workspace / "skills"
@@ -244,6 +362,7 @@ def gateway(
         workspace=config.workspace_path,
         model=config.agents.defaults.model,
         max_iterations=config.agents.defaults.max_tool_iterations,
+        memory_window=config.agents.defaults.memory_window,
         brave_api_key=config.tools.web.search.api_key or None,
         exec_config=config.tools.exec,
         cron_service=cron,
@@ -357,22 +476,33 @@ def gateway(
 @app.command()
 def agent(
     message: str = typer.Option(None, "--message", "-m", help="Message to send to the agent"),
-    session_id: str = typer.Option("cli:default", "--session", "-s", help="Session ID"),
+    session_id: str = typer.Option("cli:direct", "--session", "-s", help="Session ID"),
+    markdown: bool = typer.Option(True, "--markdown/--no-markdown", help="Render assistant output as Markdown"),
+    logs: bool = typer.Option(False, "--logs/--no-logs", help="Show nanobot runtime logs during chat"),
 ):
     """Interact with the agent directly."""
     from nanobot.config.loader import load_config
     from nanobot.bus.queue import MessageBus
     from nanobot.agent.loop import AgentLoop
+    from loguru import logger
     
     config = load_config()
     
     bus = MessageBus()
     provider = _make_provider(config)
+
+    if logs:
+        logger.enable("nanobot")
+    else:
+        logger.disable("nanobot")
     
     agent_loop = AgentLoop(
         bus=bus,
         provider=provider,
         workspace=config.workspace_path,
+        model=config.agents.defaults.model,
+        max_iterations=config.agents.defaults.max_tool_iterations,
+        memory_window=config.agents.defaults.memory_window,
         brave_api_key=config.tools.web.search.api_key or None,
         exec_config=config.tools.exec,
         restrict_to_workspace=config.tools.restrict_to_workspace,
@@ -387,31 +517,60 @@ def agent(
             if bot.persona_prompt
         },
     )
-    
+
+    # Show spinner when logs are off (no output to miss); skip when logs are on
+    def _thinking_ctx():
+        if logs:
+            from contextlib import nullcontext
+            return nullcontext()
+        # Animated spinner is safe to use with prompt_toolkit input handling
+        return console.status("[dim]nanobot is thinking...[/dim]", spinner="dots")
     if message:
         # Single message mode
         async def run_once():
-            response = await agent_loop.process_direct(message, session_id)
-            console.print(f"\n{__logo__} {response}")
-        
+            with _thinking_ctx():
+                response = await agent_loop.process_direct(message, session_id)
+            _print_agent_response(response, render_markdown=markdown)
+
         asyncio.run(run_once())
     else:
         # Interactive mode
-        console.print(f"{__logo__} Interactive mode (Ctrl+C to exit)\n")
-        
+        _init_prompt_session()
+        console.print(f"{__logo__} Interactive mode (type [bold]exit[/bold] or [bold]Ctrl+C[/bold] to quit)\n")
+
+        def _exit_on_sigint(signum, frame):
+            _restore_terminal()
+            console.print("\nGoodbye!")
+            os._exit(0)
+
+        signal.signal(signal.SIGINT, _exit_on_sigint)
+
         async def run_interactive():
             while True:
                 try:
-                    user_input = console.input("[bold blue]You:[/bold blue] ")
-                    if not user_input.strip():
+                    _flush_pending_tty_input()
+                    user_input = await _read_interactive_input_async()
+                    command = user_input.strip()
+                    if not command:
                         continue
-                    
-                    response = await agent_loop.process_direct(user_input, session_id)
-                    console.print(f"\n{__logo__} {response}\n")
+
+                    if _is_exit_command(command):
+                        _restore_terminal()
+                        console.print("\nGoodbye!")
+                        break
+
+                    with _thinking_ctx():
+                        response = await agent_loop.process_direct(user_input, session_id)
+                    _print_agent_response(response, render_markdown=markdown)
                 except KeyboardInterrupt:
+                    _restore_terminal()
                     console.print("\nGoodbye!")
                     break
-        
+                except EOFError:
+                    _restore_terminal()
+                    console.print("\nGoodbye!")
+                    break
+
         asyncio.run(run_interactive())
 
 
@@ -553,14 +712,20 @@ def _get_bridge_dir() -> Path:
 def channels_login():
     """Link device via QR code."""
     import subprocess
+    from nanobot.config.loader import load_config
     
+    config = load_config()
     bridge_dir = _get_bridge_dir()
     
     console.print(f"{__logo__} Starting bridge...")
     console.print("Scan the QR code to connect.\n")
     
+    env = {**os.environ}
+    if config.channels.whatsapp.bridge_token:
+        env["BRIDGE_TOKEN"] = config.channels.whatsapp.bridge_token
+    
     try:
-        subprocess.run(["npm", "start"], cwd=bridge_dir, check=True)
+        subprocess.run(["npm", "start"], cwd=bridge_dir, check=True, env=env)
     except subprocess.CalledProcessError as e:
         console.print(f"[red]Bridge failed: {e}[/red]")
     except FileNotFoundError:

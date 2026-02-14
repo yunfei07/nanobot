@@ -102,6 +102,7 @@ class CronTool(Tool):
             return "Error: only one of every_seconds, cron_expr, or at can be set"
 
         # Build schedule
+        delete_after = False
         if every_seconds:
             schedule = CronSchedule(kind="every", every_ms=every_seconds * 1000)
         elif cron_expr:
@@ -113,18 +114,38 @@ class CronTool(Tool):
             if at_ms <= int(datetime.now(timezone.utc).timestamp() * 1000):
                 return "Error: at must be in the future"
             schedule = CronSchedule(kind="at", at_ms=at_ms)
+            delete_after = True
         else:
             return "Error: failed to build schedule"
         
-        job = self._cron.add_job(
-            name=message[:30],
-            schedule=schedule,
-            message=message,
-            deliver=True,
-            channel=self._channel,
-            to=self._chat_id,
-            user_id=self._sender_id or None,
-        )
+        kwargs: dict[str, Any] = {}
+        if self._sender_id:
+            kwargs["user_id"] = self._sender_id
+        if delete_after:
+            kwargs["delete_after_run"] = True
+
+        try:
+            job = self._cron.add_job(
+                name=message[:30],
+                schedule=schedule,
+                message=message,
+                deliver=True,
+                channel=self._channel,
+                to=self._chat_id,
+                **kwargs,
+            )
+        except TypeError:
+            # Backward compatibility for older CronService signatures.
+            kwargs.pop("delete_after_run", None)
+            job = self._cron.add_job(
+                name=message[:30],
+                schedule=schedule,
+                message=message,
+                deliver=True,
+                channel=self._channel,
+                to=self._chat_id,
+                **kwargs,
+            )
         return f"Created job '{job.name}' (id: {job.id})"
     
     def _list_jobs(self) -> str:
