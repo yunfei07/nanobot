@@ -13,10 +13,19 @@ from rich.markdown import Markdown
 from rich.table import Table
 from rich.text import Text
 
-from prompt_toolkit import PromptSession
-from prompt_toolkit.formatted_text import HTML
-from prompt_toolkit.history import FileHistory
-from prompt_toolkit.patch_stdout import patch_stdout
+try:
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.formatted_text import HTML
+    from prompt_toolkit.history import FileHistory
+    from prompt_toolkit.patch_stdout import patch_stdout
+
+    _PROMPT_TOOLKIT_AVAILABLE = True
+except ModuleNotFoundError:
+    PromptSession = None  # type: ignore[assignment]
+    HTML = None  # type: ignore[assignment]
+    FileHistory = None  # type: ignore[assignment]
+    patch_stdout = None  # type: ignore[assignment]
+    _PROMPT_TOOLKIT_AVAILABLE = False
 
 from nanobot import __version__, __logo__
 
@@ -33,7 +42,7 @@ EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
 # CLI input: prompt_toolkit for editing, paste, history, and display
 # ---------------------------------------------------------------------------
 
-_PROMPT_SESSION: PromptSession | None = None
+_PROMPT_SESSION = None
 _SAVED_TERM_ATTRS = None  # original termios settings, restored on exit
 
 
@@ -79,6 +88,10 @@ def _init_prompt_session() -> None:
     """Create the prompt_toolkit session with persistent file history."""
     global _PROMPT_SESSION, _SAVED_TERM_ATTRS
 
+    if not _PROMPT_TOOLKIT_AVAILABLE:
+        _PROMPT_SESSION = None
+        return
+
     # Save terminal state so we can restore it on exit
     try:
         import termios
@@ -119,8 +132,8 @@ async def _read_interactive_input_async() -> str:
     - History navigation (up/down arrows)
     - Clean display (no ghost characters or artifacts)
     """
-    if _PROMPT_SESSION is None:
-        raise RuntimeError("Call _init_prompt_session() first")
+    if _PROMPT_SESSION is None or not _PROMPT_TOOLKIT_AVAILABLE or patch_stdout is None or HTML is None:
+        return await asyncio.to_thread(console.input, "[bold blue]You:[/bold blue] ")
     try:
         with patch_stdout():
             return await _PROMPT_SESSION.prompt_async(
