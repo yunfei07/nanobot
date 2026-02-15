@@ -175,18 +175,27 @@ def onboard():
     config_path = get_config_path()
     
     if config_path.exists():
-        # Load existing config — Pydantic fills in defaults for any new fields
-        config = load_config()
-        save_config(config)
-        console.print(f"[green]✓[/green] Config refreshed at {config_path} (existing values preserved)")
+        console.print(f"[yellow]Config already exists at {config_path}[/yellow]")
+        console.print("  [bold]y[/bold] = overwrite with defaults (existing values will be lost)")
+        console.print("  [bold]N[/bold] = refresh config, keeping existing values and adding new fields")
+        if typer.confirm("Overwrite?"):
+            config = Config()
+            save_config(config)
+            console.print(f"[green]✓[/green] Config reset to defaults at {config_path}")
+        else:
+            config = load_config()
+            save_config(config)
+            console.print(f"[green]✓[/green] Config refreshed at {config_path} (existing values preserved)")
     else:
-        config = Config()
-        save_config(config)
+        save_config(Config())
         console.print(f"[green]✓[/green] Created config at {config_path}")
     
     # Create workspace
     workspace = get_workspace_path()
-    console.print(f"[green]✓[/green] Created workspace at {workspace}")
+    
+    if not workspace.exists():
+        workspace.mkdir(parents=True, exist_ok=True)
+        console.print(f"[green]✓[/green] Created workspace at {workspace}")
     
     # Create default bootstrap files
     _create_workspace_templates(workspace)
@@ -327,6 +336,7 @@ def gateway(
     from nanobot.bus.queue import MessageBus
     from nanobot.agent.loop import AgentLoop
     from nanobot.channels.manager import ChannelManager
+    from nanobot.session.manager import SessionManager
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronJob
     from nanobot.heartbeat.service import HeartbeatService
@@ -341,6 +351,7 @@ def gateway(
     config = load_config()
     bus = MessageBus()
     provider = _make_provider(config)
+    session_manager = SessionManager(config.workspace_path)
 
     ios_reminder_notifier = None
     if config.channels.ios.apns_enabled:
@@ -374,6 +385,8 @@ def gateway(
         provider=provider,
         workspace=config.workspace_path,
         model=config.agents.defaults.model,
+        temperature=config.agents.defaults.temperature,
+        max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
         memory_window=config.agents.defaults.memory_window,
         brave_api_key=config.tools.web.search.api_key or None,
@@ -390,6 +403,8 @@ def gateway(
             for bot_id, bot in config.agents.bots.items()
             if bot.persona_prompt
         },
+        session_manager=session_manager,
+        mcp_servers=config.tools.mcp_servers,
     )
     
     # Set cron callback (needs agent)
@@ -471,6 +486,8 @@ def gateway(
             )
         except KeyboardInterrupt:
             console.print("\nShutting down...")
+        finally:
+            await agent.close_mcp()
             heartbeat.stop()
             cron.stop()
             agent.stop()
@@ -514,6 +531,8 @@ def agent(
         provider=provider,
         workspace=config.workspace_path,
         model=config.agents.defaults.model,
+        temperature=config.agents.defaults.temperature,
+        max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
         memory_window=config.agents.defaults.memory_window,
         brave_api_key=config.tools.web.search.api_key or None,
@@ -529,6 +548,7 @@ def agent(
             for bot_id, bot in config.agents.bots.items()
             if bot.persona_prompt
         },
+        mcp_servers=config.tools.mcp_servers,
     )
 
     # Show spinner when logs are off (no output to miss); skip when logs are on
@@ -544,7 +564,7 @@ def agent(
             with _thinking_ctx():
                 response = await agent_loop.process_direct(message, session_id)
             _print_agent_response(response, render_markdown=markdown)
-
+            await agent_loop.close_mcp()
         asyncio.run(run_once())
     else:
         # Interactive mode
@@ -559,31 +579,33 @@ def agent(
         signal.signal(signal.SIGINT, _exit_on_sigint)
 
         async def run_interactive():
-            while True:
-                try:
-                    _flush_pending_tty_input()
-                    user_input = await _read_interactive_input_async()
-                    command = user_input.strip()
-                    if not command:
-                        continue
+            try:
+                while True:
+                    try:
+                        _flush_pending_tty_input()
+                        user_input = await _read_interactive_input_async()
+                        command = user_input.strip()
+                        if not command:
+                            continue
 
-                    if _is_exit_command(command):
+                        if _is_exit_command(command):
+                            _restore_terminal()
+                            console.print("\nGoodbye!")
+                            break
+                        
+                        with _thinking_ctx():
+                            response = await agent_loop.process_direct(user_input, session_id)
+                        _print_agent_response(response, render_markdown=markdown)
+                    except KeyboardInterrupt:
                         _restore_terminal()
                         console.print("\nGoodbye!")
                         break
-
-                    with _thinking_ctx():
-                        response = await agent_loop.process_direct(user_input, session_id)
-                    _print_agent_response(response, render_markdown=markdown)
-                except KeyboardInterrupt:
-                    _restore_terminal()
-                    console.print("\nGoodbye!")
-                    break
-                except EOFError:
-                    _restore_terminal()
-                    console.print("\nGoodbye!")
-                    break
-
+                    except EOFError:
+                        _restore_terminal()
+                        console.print("\nGoodbye!")
+                        break
+            finally:
+                await agent_loop.close_mcp()
         asyncio.run(run_interactive())
 
 

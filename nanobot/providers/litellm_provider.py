@@ -1,7 +1,13 @@
 """LiteLLM provider implementation for multi-provider support."""
 
+import json
 import os
 from typing import Any
+
+try:
+    import json_repair
+except ModuleNotFoundError:
+    json_repair = None  # type: ignore[assignment]
 
 import litellm
 from litellm import acompletion
@@ -172,6 +178,9 @@ class LiteLLMProvider(LLMProvider):
         if "kimi-k2.5" in model.lower():
             temperature = 1.0
 
+        # Clamp max_tokens to at least 1 — negative or zero values cause
+        # LiteLLM to reject the request with "max_tokens must be at least 1".
+        max_tokens = max(1, max_tokens)
         kwargs: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -215,11 +224,16 @@ class LiteLLMProvider(LLMProvider):
                 # Parse arguments from JSON string if needed
                 args = tc.function.arguments
                 if isinstance(args, str):
-                    import json
                     try:
                         args = json.loads(args)
                     except json.JSONDecodeError:
-                        args = {"raw": args}
+                        if json_repair is not None:
+                            try:
+                                args = json_repair.loads(args)
+                            except Exception:
+                                args = {"raw": args}
+                        else:
+                            args = {"raw": args}
                 
                 tool_calls.append(ToolCallRequest(
                     id=tc.id,
