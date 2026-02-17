@@ -225,8 +225,12 @@ To recall past events, grep {workspace_path}/memory/HISTORY.md"""
         Returns:
             Updated message list.
         """
-        msg: dict[str, Any] = {"role": "assistant", "content": content or ""}
-        
+        msg: dict[str, Any] = {"role": "assistant"}
+
+        # Omit empty content — some backends reject empty text blocks
+        if content:
+            msg["content"] = content
+
         if tool_calls:
             msg["tool_calls"] = tool_calls
         if assistant_metadata:
@@ -236,6 +240,5 @@ To recall past events, grep {workspace_path}/memory/HISTORY.md"""
                     continue
                 if value is not None:
                     msg[key] = value
-        
         messages.append(msg)
         return messages

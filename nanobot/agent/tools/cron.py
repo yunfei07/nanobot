@@ -53,6 +53,10 @@ class CronTool(Tool):
                     "type": "string",
                     "description": "Cron expression like '0 9 * * *' (for scheduled tasks)"
                 },
+                "tz": {
+                    "type": "string",
+                    "description": "IANA timezone for cron expressions (e.g. 'America/Vancouver')"
+                },
                 "at": {
                     "type": "string",
                     "description": "One-shot run time in ISO format (e.g. '2026-02-09T09:00:00+08:00')"
@@ -71,12 +75,13 @@ class CronTool(Tool):
         message: str = "",
         every_seconds: int | None = None,
         cron_expr: str | None = None,
+        tz: str | None = None,
         at: str | None = None,
         job_id: str | None = None,
         **kwargs: Any
     ) -> str:
         if action == "add":
-            return self._add_job(message, every_seconds, cron_expr, at)
+            return self._add_job(message, every_seconds, cron_expr, tz, at)
         elif action == "list":
             return self._list_jobs()
         elif action == "remove":
@@ -88,6 +93,7 @@ class CronTool(Tool):
         message: str,
         every_seconds: int | None,
         cron_expr: str | None,
+        tz: str | None,
         at: str | None,
     ) -> str:
         if not message:
@@ -100,13 +106,20 @@ class CronTool(Tool):
             return "Error: one of every_seconds, cron_expr, or at is required"
         if provided > 1:
             return "Error: only one of every_seconds, cron_expr, or at can be set"
-
+        if tz and not cron_expr:
+            return "Error: tz can only be used with cron_expr"
+        if tz:
+            from zoneinfo import ZoneInfo
+            try:
+                ZoneInfo(tz)
+            except (KeyError, Exception):
+                return f"Error: unknown timezone '{tz}'"
         # Build schedule
         delete_after = False
         if every_seconds:
             schedule = CronSchedule(kind="every", every_ms=every_seconds * 1000)
         elif cron_expr:
-            schedule = CronSchedule(kind="cron", expr=cron_expr)
+            schedule = CronSchedule(kind="cron", expr=cron_expr, tz=tz)
         elif at:
             at_ms = self._parse_at_to_ms(at)
             if at_ms is None:
