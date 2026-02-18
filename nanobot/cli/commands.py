@@ -971,6 +971,7 @@ def cron_run(
 def status():
     """Show nanobot status."""
     from nanobot.config.loader import load_config, get_config_path
+    from nanobot.providers.registry import PROVIDERS
 
     config_path = get_config_path()
     config = load_config()
@@ -983,24 +984,26 @@ def status():
 
     if config_path.exists():
         console.print(f"Model: {config.agents.defaults.model}")
-        
-        # Check API keys
-        has_openrouter = bool(config.providers.openrouter.api_key)
-        has_anthropic = bool(config.providers.anthropic.api_key)
-        has_openai = bool(config.providers.openai.api_key)
-        has_gemini = bool(config.providers.gemini.api_key)
-        has_zhipu = bool(config.providers.zhipu.api_key)
-        has_vllm = bool(config.providers.vllm.api_base)
-        has_aihubmix = bool(config.providers.aihubmix.api_key)
-        
-        console.print(f"OpenRouter API: {'[green]✓[/green]' if has_openrouter else '[dim]not set[/dim]'}")
-        console.print(f"Anthropic API: {'[green]✓[/green]' if has_anthropic else '[dim]not set[/dim]'}")
-        console.print(f"OpenAI API: {'[green]✓[/green]' if has_openai else '[dim]not set[/dim]'}")
-        console.print(f"Gemini API: {'[green]✓[/green]' if has_gemini else '[dim]not set[/dim]'}")
-        console.print(f"Zhipu AI API: {'[green]✓[/green]' if has_zhipu else '[dim]not set[/dim]'}")
-        console.print(f"AiHubMix API: {'[green]✓[/green]' if has_aihubmix else '[dim]not set[/dim]'}")
-        vllm_status = f"[green]✓ {config.providers.vllm.api_base}[/green]" if has_vllm else "[dim]not set[/dim]"
-        console.print(f"vLLM/Local: {vllm_status}")
+        # Check API keys from registry
+        for spec in PROVIDERS:
+            p = getattr(config.providers, spec.name, None)
+            if p is None:
+                continue
+            if spec.is_oauth:
+                has_token = bool(p.api_key)
+                if has_token:
+                    console.print(f"{spec.label}: [green]✓ (OAuth)[/green]")
+                else:
+                    console.print(f"{spec.label}: [dim]not set[/dim]")
+            elif spec.is_local:
+                # Local deployments show api_base instead of api_key
+                if p.api_base:
+                    console.print(f"{spec.label}: [green]✓ {p.api_base}[/green]")
+                else:
+                    console.print(f"{spec.label}: [dim]not set[/dim]")
+            else:
+                has_key = bool(p.api_key)
+                console.print(f"{spec.label}: {'[green]✓[/green]' if has_key else '[dim]not set[/dim]'}")
 
 
 # ============================================================================
@@ -1011,42 +1014,78 @@ provider_app = typer.Typer(help="Manage providers")
 app.add_typer(provider_app, name="provider")
 
 
+_LOGIN_HANDLERS: dict[str, callable] = {}
+
+
+def _register_login(name: str):
+    def decorator(fn):
+        _LOGIN_HANDLERS[name] = fn
+        return fn
+    return decorator
+
+
 @provider_app.command("login")
 def provider_login(
-    provider: str = typer.Argument(..., help="OAuth provider to authenticate with (e.g., 'openai-codex')"),
+    provider: str = typer.Argument(..., help="OAuth provider (e.g. 'openai-codex', 'github-copilot')"),
 ):
     """Authenticate with an OAuth provider."""
-    console.print(f"{__logo__} OAuth Login - {provider}\n")
+    from nanobot.providers.registry import PROVIDERS
 
-    if provider == "openai-codex":
+    key = provider.replace("-", "_")
+    spec = next((s for s in PROVIDERS if s.name == key and s.is_oauth), None)
+    if not spec:
+        names = ", ".join(s.name.replace("_", "-") for s in PROVIDERS if s.is_oauth)
+        console.print(f"[red]Unknown OAuth provider: {provider}[/red]  Supported: {names}")
+        raise typer.Exit(1)
+
+    handler = _LOGIN_HANDLERS.get(spec.name)
+    if not handler:
+        console.print(f"[red]Login not implemented for {spec.label}[/red]")
+        raise typer.Exit(1)
+
+    console.print(f"{__logo__} OAuth Login - {spec.label}\n")
+    handler()
+
+
+@_register_login("openai_codex")
+def _login_openai_codex() -> None:
+    try:
+        from oauth_cli_kit import get_token, login_oauth_interactive
+        token = None
         try:
-            from oauth_cli_kit import get_token, login_oauth_interactive
-            token = None
-            try:
-                token = get_token()
-            except Exception:
-                token = None
-            if not (token and token.access):
-                console.print("[cyan]No valid token found. Starting interactive OAuth login...[/cyan]")
-                console.print("A browser window may open for you to authenticate.\n")
-                token = login_oauth_interactive(
-                    print_fn=lambda s: console.print(s),
-                    prompt_fn=lambda s: typer.prompt(s),
-                )
-            if not (token and token.access):
-                console.print("[red]✗ Authentication failed[/red]")
-                raise typer.Exit(1)
-            console.print("[green]✓ Successfully authenticated with OpenAI Codex![/green]")
-            console.print(f"[dim]Account ID: {token.account_id}[/dim]")
-        except ImportError:
-            console.print("[red]oauth_cli_kit not installed. Run: pip install oauth-cli-kit[/red]")
+            token = get_token()
+        except Exception:
+            pass
+        if not (token and token.access):
+            console.print("[cyan]Starting interactive OAuth login...[/cyan]\n")
+            token = login_oauth_interactive(
+                print_fn=lambda s: console.print(s),
+                prompt_fn=lambda s: typer.prompt(s),
+            )
+        if not (token and token.access):
+            console.print("[red]✗ Authentication failed[/red]")
             raise typer.Exit(1)
-        except Exception as e:
-            console.print(f"[red]Authentication error: {e}[/red]")
-            raise typer.Exit(1)
-    else:
-        console.print(f"[red]Unknown OAuth provider: {provider}[/red]")
-        console.print("[yellow]Supported providers: openai-codex[/yellow]")
+        console.print(f"[green]✓ Authenticated with OpenAI Codex[/green]  [dim]{token.account_id}[/dim]")
+    except ImportError:
+        console.print("[red]oauth_cli_kit not installed. Run: pip install oauth-cli-kit[/red]")
+        raise typer.Exit(1)
+
+
+@_register_login("github_copilot")
+def _login_github_copilot() -> None:
+    import asyncio
+
+    console.print("[cyan]Starting GitHub Copilot device flow...[/cyan]\n")
+
+    async def _trigger():
+        from litellm import acompletion
+        await acompletion(model="github_copilot/gpt-4o", messages=[{"role": "user", "content": "hi"}], max_tokens=1)
+
+    try:
+        asyncio.run(_trigger())
+        console.print("[green]✓ Authenticated with GitHub Copilot[/green]")
+    except Exception as e:
+        console.print(f"[red]Authentication error: {e}[/red]")
         raise typer.Exit(1)
 
 

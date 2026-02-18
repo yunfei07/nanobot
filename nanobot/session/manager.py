@@ -60,7 +60,7 @@ class Session:
         for message in recent:
             record: dict[str, Any] = {
                 "role": message["role"],
-                "content": message["content"],
+                "content": message.get("content", ""),
             }
             for field in self._HISTORY_OPTIONAL_FIELDS:
                 if field in message and message[field] is not None:
@@ -84,9 +84,10 @@ class SessionManager:
 
     def __init__(self, workspace: Path):
         self.workspace = workspace
+        self.legacy_sessions_dir = (Path.home() / ".nanobot" / "sessions").expanduser()
         workspace_sessions = ensure_dir(Path(workspace).expanduser() / "sessions")
         default_workspace = (Path.home() / ".nanobot" / "workspace").expanduser()
-        legacy_sessions = (Path.home() / ".nanobot" / "sessions").expanduser()
+        legacy_sessions = self.legacy_sessions_dir
 
         # Backward compatibility: keep using legacy sessions path for default workspace users.
         if (
@@ -102,6 +103,11 @@ class SessionManager:
         """Get the file path for a session."""
         safe_key = safe_filename(key.replace(":", "_"))
         return self.sessions_dir / f"{safe_key}.jsonl"
+
+    def _get_legacy_session_path(self, key: str) -> Path:
+        """Legacy global session path (~/.nanobot/sessions/)."""
+        safe_key = safe_filename(key.replace(":", "_"))
+        return self.legacy_sessions_dir / f"{safe_key}.jsonl"
     
     def get_or_create(self, key: str) -> Session:
         """
@@ -126,6 +132,12 @@ class SessionManager:
     def _load(self, key: str) -> Session | None:
         """Load a session from disk."""
         path = self._get_session_path(key)
+        if not path.exists():
+            legacy_path = self._get_legacy_session_path(key)
+            if legacy_path.exists():
+                import shutil
+                shutil.move(str(legacy_path), str(path))
+                logger.info(f"Migrated session {key} from legacy path")
 
         if not path.exists():
             return None
