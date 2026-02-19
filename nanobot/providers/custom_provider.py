@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
-import json_repair
+try:
+    import json_repair
+except ModuleNotFoundError:
+    json_repair = None  # type: ignore[assignment]
 from openai import AsyncOpenAI
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
@@ -31,11 +35,24 @@ class CustomProvider(LLMProvider):
     def _parse(self, response: Any) -> LLMResponse:
         choice = response.choices[0]
         msg = choice.message
-        tool_calls = [
-            ToolCallRequest(id=tc.id, name=tc.function.name,
-                            arguments=json_repair.loads(tc.function.arguments) if isinstance(tc.function.arguments, str) else tc.function.arguments)
-            for tc in (msg.tool_calls or [])
-        ]
+        tool_calls: list[ToolCallRequest] = []
+        for tc in (msg.tool_calls or []):
+            args = tc.function.arguments
+            if isinstance(args, str):
+                if json_repair is not None:
+                    try:
+                        args = json_repair.loads(args)
+                    except Exception:
+                        args = json.loads(args)
+                else:
+                    args = json.loads(args)
+            tool_calls.append(
+                ToolCallRequest(
+                    id=tc.id,
+                    name=tc.function.name,
+                    arguments=args,
+                )
+            )
         u = response.usage
         return LLMResponse(
             content=msg.content, tool_calls=tool_calls, finish_reason=choice.finish_reason or "stop",
