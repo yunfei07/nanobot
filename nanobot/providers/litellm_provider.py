@@ -15,6 +15,10 @@ from litellm import acompletion
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
 
+# Standard OpenAI chat-completion message keys; extras (e.g. reasoning_content) are stripped for strict providers.
+_ALLOWED_MSG_KEYS = frozenset({"role", "content", "tool_calls", "tool_call_id", "name"})
+
+
 class LiteLLMProvider(LLMProvider):
     """
     LLM provider using LiteLLM for multi-provider support.
@@ -108,7 +112,17 @@ class LiteLLMProvider(LLMProvider):
         litellm.suppress_debug_info = True
         # Drop unsupported parameters for providers (e.g., gpt-5 rejects some params)
         litellm.drop_params = True
-
+    
+    @staticmethod
+    def _sanitize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Strip non-standard keys and ensure assistant messages have a content key."""
+        sanitized = []
+        for msg in messages:
+            clean = {k: v for k, v in msg.items() if k in _ALLOWED_MSG_KEYS}
+            if clean.get("role") == "assistant" and "content" not in clean:
+                clean["content"] = None
+            sanitized.append(clean)
+        return sanitized
     async def chat(
         self,
         messages: list[dict[str, Any]],
@@ -185,7 +199,7 @@ class LiteLLMProvider(LLMProvider):
         max_tokens = max(1, max_tokens)
         kwargs: dict[str, Any] = {
             "model": model,
-            "messages": messages,
+            "messages": self._sanitize_messages(messages),
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
